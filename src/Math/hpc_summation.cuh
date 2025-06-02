@@ -32,7 +32,7 @@ kSumVector(const TBase* vdata, const size_t length, TSum* result) {
   TSum thread_sum = (TSum)(0);
   const size_t ginc = gridDim.x * blockDim.x;
   for (size_t pos = (blockIdx.x * blockDim.x) + threadIdx.x; pos < length; pos += ginc) {
-    thread_sum += static_cast<TSum>(vdata[pos]);
+    thread_sum += (TSum)(vdata[pos]);
   }
 #if STORMM_USE_HIP
   thread_sum += SHFL_DOWN(thread_sum, 32);
