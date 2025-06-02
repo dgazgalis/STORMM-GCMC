@@ -272,7 +272,7 @@ int main(int argc, const char* argv[]) {
 #endif
   sc.computeTotalEnergy();
   const std::vector<double> sc_totals = sc.reportInstantaneousStates(StateVariable::TOTAL_ENERGY);
-  
+
   // Create the report file.
   ReportControls repcon = ui.getReportNamelistInfo();
   std::vector<SectionContents> outp;
