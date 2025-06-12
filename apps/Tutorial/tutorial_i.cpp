@@ -93,21 +93,23 @@ int main(int argc, const char* argv[]) {
   }
   printf("\n");
 
-  // Allocate for the answer
+  // Allocate a buffer for the answer
   Hybrid<int> sum_of_xi(gpu.getSMPCount(), "Our_Answer");
 
 #ifdef STORMM_USE_HPC
   // Upload the data to the GPU, then grab pointers to the data and allocated answer on the GPU
   xferable_integers.upload();
   const int* devc_xi_ptr = xferable_integers.data(HybridTargetLevel::DEVICE);
+  const void* vdevc_xi_ptr = reinterpret_cast<const void*>(devc_xi_ptr);
   int* sum_ptr = sum_of_xi.data(HybridTargetLevel::DEVICE);
+  void* vsum_ptr = reinterpret_cast<void*>(sum_ptr);
 
   // Launch a kernel via a call to a function compiled in the associated CUDA unit
-  wrapTheSummationLaunch(devc_xi_ptr, nxi, sum_ptr, int_type_index, gpu);
+  wrapTheSummationLaunch(vdevc_xi_ptr, nxi, vsum_ptr, int_type_index, gpu);
 
   // Download the result
   printf("The sum of the set of integers on the host is:          %d\n",
-         sum<int>(host_xi_ptr, nxi));
+         sum<int>(host_xi_ptr, xferable_integers.size()));
   printf("Before downloading, the sum of the answer buffer reads: %d\n",
          sum<int>(sum_of_xi.data(HybridTargetLevel::HOST), gpu.getSMPCount()));
   sum_of_xi.download();
