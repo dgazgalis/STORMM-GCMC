@@ -124,9 +124,9 @@ int main(int argc, const char* argv[]) {
                     InputRepeats::YES);
   t_nml->addHelp("-topol", "Select an input coordinate file.  This input may be repeated.\n");
   t_nml->addKeyword("energy_loop", NamelistType::INTEGER, std::to_string(1));
-  t_nml->addHelp("Specify the number of times to loop over the electrostatic energy calculation "
-                 "for each system, in order to get a good reading of the average time to perform "
-                 "the nested loop over all atoms.");
+  t_nml->addHelp("energy_loop", "Specify the number of times to loop over the electrostatic "
+                 "energy calculation for each system, in order to get a good reading of the "
+                 "average time to perform the nested loop over all atoms.");
 
   // Initialize the testing environment
   TestEnvironment tenv(argc, argv, &clip);
