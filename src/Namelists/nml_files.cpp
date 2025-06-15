@@ -894,6 +894,9 @@ NamelistEmulator filesInput(const TextFile &tf, int *start_line, bool *found,
                 "the \"outfmt\" keyword with setting \"INDIVIDUAL\" to obtain separate files for "
                 "each system along with a \".master\" output file providing details of the entire "
                 "run.");
+  t_nml.addHelp("-t", "Name of the input transcript file, holding a detailed record of all inputs "
+                "given by the user as well as inputs which were possible with the available "
+                "namelist blocks");
   t_nml.addHelp("-x", "Trajectory output file (base name) for each system.  The actual name of "
                 "each output file will be \"yyy_(sysID).zzz\", where \"yyy\" is any part of the "
                 "-x string value preceding the final dot [.], \"_(sysID)\" is based on the name "

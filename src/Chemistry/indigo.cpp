@@ -980,7 +980,7 @@ IndigoFragment::IndigoFragment(const std::vector<int> &centers_list_in,
     }
     viable = (viable && negative_carbons <= maximum_negative_carbons);
     if (viable) {
-
+        
       // If not all atom centers are participating, increment the number of centers that are
       // included in the fragment and start the search for the state of the next atom at its
       // first position.  Otherwise, compute the score and net charge of this state, then push
