@@ -126,7 +126,6 @@ build_docker:
       if [ "$CI_COMMIT_BRANCH" = "main" ]; then
         gcloud artifacts docker tags add \
           us-docker.pkg.dev/psivant-data/containers/stormm:$CI_COMMIT_SHA \
-          us-docker.pkg.dev/psivant-data/containers/stormm:$CI_COMMIT_BRANCH \
           us-docker.pkg.dev/psivant-data/containers/stormm:latest
       fi
 
