@@ -496,7 +496,6 @@ void printReport(const SystemCache &sc, const CommandLineParser &clip, const Use
   const SynthesisMapReader sandbox_mapr = sandbox_map.data();
   switch (repcon.getOutputScope()) {
   case OutputScope::AVERAGES:
-    break;
   case OutputScope::CLUSTER_AVERAGES:
     {
       std::string shortcut_key;
