@@ -30,7 +30,7 @@ constexpr int default_indigo_energy_gap = 3187;
 
 /// \brief The maximum number of negatively charged carbon atoms that a fragment can have (some
 ///        corner case might lead to this limit being increased under special circumstances)
-constexpr int maximum_negative_carbons = 2;
+constexpr int maximum_negative_carbons = 1;
 
 /// \brief The maximum bond order is a triple bond
 constexpr int maximum_bond_order = 3;
