@@ -70,6 +70,7 @@ using synthesis::SyValenceKit;
 using topology::AtomGraph;
 using topology::ConstraintKit;
 using topology::ImplicitSolventKit;
+using topology::LambdaNonbondedKit;
 using topology::NonbondedKit;
 using topology::ValenceKit;
 using topology::VirtualSiteKit;
@@ -147,6 +148,23 @@ void dynaStep(const Tcoord* xcrd, const Tcoord* ycrd, const Tcoord* zcrd, const 
               const DynamicsControls &dyncon, int system_index = 0, Tcalc gpos_scale_factor = 1.0,
               Tcalc vel_scale_factor = 1.0, Tcalc frc_scale_factor = 1.0);
 
+/// \brief Lambda-aware MD dynamics step for GCMC/NCMC simulations with per-atom coupling.
+///        Identical to dynaStep except uses LambdaNonbondedKit for lambda-scaled forces.
+template <typename Tcoord, typename Tcalc, typename Tcalc2, typename Tcalc4>
+void lambdaDynaStep(const Tcoord* xcrd, const Tcoord* ycrd, const Tcoord* zcrd, const Tcoord* xvel,
+                    const Tcoord* yvel, const Tcoord* zvel, Tcoord* xfrc, Tcoord* yfrc, Tcoord* zfrc,
+                    Tcoord* xalt, Tcoord* yalt, Tcoord* zalt, Tcoord* vxalt, Tcoord* vyalt,
+                    Tcoord* vzalt, Tcoord* fxalt, Tcoord* fyalt, Tcoord* fzalt, ScoreCard *sc,
+                    const ThermostatWriter<Tcalc> &tstr, const ValenceKit<Tcalc> &vk,
+                    const LambdaNonbondedKit<Tcalc> &lambda_nbk, const ImplicitSolventKit<Tcalc> &isk,
+                    const NeckGeneralizedBornKit<Tcalc> &neck_gbk, Tcoord* effective_gb_radii,
+                    Tcoord* psi, Tcoord* sumdeijda, const RestraintKit<Tcalc, Tcalc2, Tcalc4> &rar,
+                    const VirtualSiteKit<Tcalc> &vsk, const ChemicalDetailsKit &cdk,
+                    const ConstraintKit<Tcalc> &cnk, const StaticExclusionMaskReader &ser,
+                    const DynamicsControls &dyncon, int system_index = 0, Tcalc gpos_scale_factor = 1.0,
+                    Tcalc vel_scale_factor = 1.0, Tcalc frc_scale_factor = 1.0,
+                    Tcalc vdw_coupling_threshold = 0.75, Tcalc softcore_alpha = 0.5);
+
 template <typename Tcoord, typename Tacc, typename Tcoord4,
           typename Tcalc, typename Tcalc2, typename Tcalc4>
 void dynaStep(PsSynthesisWriter *poly_psw, CellGridWriter<void, void, void, void> *cgw_v,
@@ -165,6 +183,16 @@ void dynaStep(PhaseSpaceWriter *psw, ScoreCard *sc, const ThermostatWriter<doubl
               const VirtualSiteKit<double> &vsk, const ChemicalDetailsKit &cdk,
               const ConstraintKit<double> &cnk, const StaticExclusionMaskReader &ser,
               const DynamicsControls &dyncon, int system_index = 0);
+
+void lambdaDynaStep(PhaseSpaceWriter *psw, ScoreCard *sc, const ThermostatWriter<double> &tstr,
+                    const ValenceKit<double> &vk, const LambdaNonbondedKit<double> &lambda_nbk,
+                    const ImplicitSolventKit<double> &isk,
+                    const NeckGeneralizedBornKit<double> &neck_gbk, double* effective_gb_radii,
+                    double* psi, double* sumdeijda, const RestraintKit<double, double2, double4> &rar,
+                    const VirtualSiteKit<double> &vsk, const ChemicalDetailsKit &cdk,
+                    const ConstraintKit<double> &cnk, const StaticExclusionMaskReader &ser,
+                    const DynamicsControls &dyncon, int system_index = 0,
+                    double vdw_coupling_threshold = 0.75, double softcore_alpha = 0.5);
 /// \}
 
 /// \brief Carry out molecular dynamics in implicit solvent (or vacuum conditions) for a specified

@@ -234,6 +234,35 @@ double evaluateGeneralizedBornEnergy(const NonbondedKit<Tcalc> nbk,
                                      int system_index = 0, int force_scale_bits = 23);
 /// \}
 
+/// \brief Evaluate nonbonded energy with per-atom lambda scaling for GCMC
+///
+/// This function evaluates nonbonded interactions with per-atom lambda scaling
+/// factors, supporting Grand Canonical Monte Carlo simulations where molecules
+/// can be gradually coupled or decoupled from the system.
+///
+/// \param nbk            Nonbonded parameters kit
+/// \param ser            Static exclusion mask reader
+/// \param psw            Phase space writer (coordinates, forces)
+/// \param lambda_vdw     Per-atom VDW lambda values [0, 1]
+/// \param lambda_ele     Per-atom electrostatic lambda values [0, 1]
+/// \param atom_sigma     Pre-computed LJ sigma values for each atom
+/// \param atom_epsilon   Pre-computed LJ epsilon values for each atom
+/// \param ecard          Score card for energy accumulation
+/// \param eval_force     Whether to evaluate forces
+/// \param system_index   System index in scorecard
+/// \return double2 with x=electrostatic energy, y=VDW energy (kcal/mol)
+double2 evaluateLambdaScaledNonbonded(
+    const NonbondedKit<double>& nbk,
+    const StaticExclusionMaskReader& ser,
+    PhaseSpaceWriter& psw,
+    const std::vector<double>& lambda_vdw,
+    const std::vector<double>& lambda_ele,
+    const std::vector<double>& atom_sigma,
+    const std::vector<double>& atom_epsilon,
+    ScoreCard* ecard,
+    EvaluateForce eval_force = EvaluateForce::NO,
+    int system_index = 0);
+
 } // namespace energy
 } // namespace stormm
 

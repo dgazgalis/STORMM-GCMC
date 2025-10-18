@@ -346,6 +346,81 @@ template <typename T> struct NonbondedKit {
                             ///<   in energy calculations)
 };
 
+/// \brief Lambda-aware non-bonded parameters for GCMC/NCMC simulations.
+///        Extends NonbondedKit with per-atom lambda scaling factors for alchemical transformations.
+///        Lambda values control the coupling strength: 0.0 = ghost (fully decoupled),
+///        1.0 = active (fully coupled), 0 < lambda < 1 = partial coupling.
+template <typename T> struct LambdaNonbondedKit {
+
+  /// \brief Constructor extends NonbondedKit with per-atom lambda arrays
+  ///
+  ///        See NonbondedKit constructor for descriptions of base parameters.
+  ///
+  /// \param lambda_vdw_in   Per-atom VDW coupling strength (0.0 = ghost, 1.0 = full)
+  /// \param lambda_ele_in   Per-atom electrostatic coupling strength (0.0 = ghost, 1.0 = full)
+  explicit LambdaNonbondedKit(int natom_in, int n_q_types_in, int n_lj_types_in,
+                              const T coulomb_constant_in, const T* charge_in,
+                              const int* q_idx_in, const int* lj_idx_in,
+                              const T* q_parameter_in, const T* lja_coeff_in,
+                              const T* ljb_coeff_in, const T* ljc_coeff_in,
+                              const T* lja_14_coeff_in, const T* ljb_14_coeff_in,
+                              const T* ljc_14_coeff_in, const T* lj_sigma_in,
+                              const T* lj_14_sigma_in, const int* nb11x_in,
+                              const int* nb11_bounds_in, const int* nb12x_in,
+                              const int* nb12_bounds_in, const int* nb13x_in,
+                              const int* nb13_bounds_in, const int* nb14x_in,
+                              const int* nb14_bounds_in, const T* lj_type_corr_in,
+                              const T* lambda_vdw_in, const T* lambda_ele_in) :
+      natom(natom_in), n_q_types(n_q_types_in), n_lj_types(n_lj_types_in),
+      coulomb_constant(coulomb_constant_in), charge(charge_in), q_idx(q_idx_in),
+      lj_idx(lj_idx_in), q_parameter(q_parameter_in), lja_coeff(lja_coeff_in),
+      ljb_coeff(ljb_coeff_in), ljc_coeff(ljc_coeff_in), lja_14_coeff(lja_14_coeff_in),
+      ljb_14_coeff(ljb_14_coeff_in), ljc_14_coeff(ljc_14_coeff_in), lj_sigma(lj_sigma_in),
+      lj_14_sigma(lj_14_sigma_in), nb11x(nb11x_in), nb11_bounds(nb11_bounds_in),
+      nb12x(nb12x_in), nb12_bounds(nb12_bounds_in), nb13x(nb13x_in),
+      nb13_bounds(nb13_bounds_in), nb14x(nb14x_in), nb14_bounds(nb14_bounds_in),
+      lj_type_corr(lj_type_corr_in), lambda_vdw(lambda_vdw_in), lambda_ele(lambda_ele_in)
+  {}
+
+  /// \brief Take the default copy and move constructors.  The assignment operators will get
+  ///        implicitly deleted as this is just a collection of constants.
+  /// \{
+  LambdaNonbondedKit(const LambdaNonbondedKit &original) = default;
+  LambdaNonbondedKit(LambdaNonbondedKit &&other) = default;
+  /// \}
+
+  // All member variables from NonbondedKit
+  const int natom;          ///< The number of atoms in the system
+  const int n_q_types;      ///< The number of unique charge types in the system
+  const int n_lj_types;     ///< The number of unique Lennard-Jones atom types in the system
+  const T coulomb_constant; ///< Coulomb's constant in units of kcal-A/mol-e^2
+  const T* charge;          ///< Partial atomic charges on all atoms
+  const int* q_idx;         ///< Partial charge type indices for all atoms
+  const int* lj_idx;        ///< Lennard-Jones type indices of all atoms
+  const T* q_parameter;     ///< Partial atomic charges for each charge type
+  const T* lja_coeff;       ///< Lennard-Jones A coefficients, square matrix
+  const T* ljb_coeff;       ///< Lennard-Jones B coefficients, square matrix
+  const T* ljc_coeff;       ///< Lennard-Jones C coefficients, square matrix
+  const T* lja_14_coeff;    ///< Lennard-Jones A coefficients for 1:4 interactions
+  const T* ljb_14_coeff;    ///< Lennard-Jones B coefficients for 1:4 interactions
+  const T* ljc_14_coeff;    ///< Lennard-Jones C coefficients for 1:4 interactions
+  const T* lj_sigma;        ///< Lennard-Jones sigma parameters
+  const T* lj_14_sigma;     ///< Lennard-Jones sigma parameters for 1:4 interactions
+  const int* nb11x;         ///< Non-bonded 1:1 exclusions (virtual sites)
+  const int* nb11_bounds;   ///< Non-bonded 1:1 exclusion array bounds
+  const int* nb12x;         ///< Non-bonded 1:2 exclusions (bonded atoms)
+  const int* nb12_bounds;   ///< Non-bonded 1:2 exclusion array bounds
+  const int* nb13x;         ///< Non-bonded 1:3 exclusions (angles, Urey-Bradley)
+  const int* nb13_bounds;   ///< Non-bonded 1:3 exclusion array bounds
+  const int* nb14x;         ///< Non-bonded 1:4 exclusions (proper torsions)
+  const int* nb14_bounds;   ///< Non-bonded 1:4 exclusion array bounds
+  const T* lj_type_corr;    ///< Lennard-Jones energy corrections per atom type
+
+  // NEW: Lambda scaling factors for alchemical transformations
+  const T* lambda_vdw;      ///< Per-atom VDW coupling strength (0.0 = ghost, 1.0 = full)
+  const T* lambda_ele;      ///< Per-atom electrostatic coupling (0.0 = ghost, 1.0 = full)
+};
+
 /// \brief Information needed for Generalized Born (and perhaps other) implicit solvent methods.
 ///        This information is collected into an object separate from the non-bonded kit because
 ///        only a subset of calculations will use GB for the solvent conditions.

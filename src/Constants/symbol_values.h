@@ -49,6 +49,13 @@ constexpr double boltzmann_constant = (1.38064852e-23) / 4184.0 * avogadro_numbe
 constexpr double boltzmann_constant_gafs = boltzmann_constant * kcal_to_gafs;
 constexpr float boltzmann_constant_f = boltzmann_constant;
 constexpr float boltzmann_constant_gafs_f = boltzmann_constant_gafs;
+
+/// \brief Boltzmann constant in MD units (amu·Å²/fs²/K)
+/// This is derived from kB = 1.380649e-23 J/K with proper unit conversion:
+/// kB = 1.380649e-23 * 6.022e26 * 1e20 / 1e30 = 0.8314472 amu·Å²/fs²/K
+/// Used for velocity generation in Maxwell-Boltzmann distribution
+constexpr double boltzmann_constant_md = 0.8314472;
+constexpr float boltzmann_constant_md_f = 0.8314472f;
   
 /// \brief Hartree to kcal/mol conversion
 constexpr double hartree_to_kcal = 627.509474;

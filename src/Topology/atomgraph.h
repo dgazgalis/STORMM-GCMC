@@ -1912,6 +1912,122 @@ bool scanForExclusion(const std::vector<int> &list, int llim, int hlim, int part
 ///                   y =>second and x => second / y => first.
 void cullPriorExclusions(std::vector<int3> *proposals, const std::vector<int3> &priors);
 
+/// \brief Structure to hold ghost molecule metadata for GCMC sampling
+struct GhostMoleculeMetadata {
+  int base_molecule_count;                ///< Number of molecules in base topology
+  int n_ghost_molecules;                   ///< Number of ghost molecules added
+  int base_atom_count;                     ///< Number of atoms in base topology
+  int base_residue_count;                  ///< Number of residues in base topology
+  std::vector<int> ghost_molecule_indices; ///< Molecule indices of ghost molecules
+  std::vector<int> ghost_residue_indices;  ///< Residue indices of ghost residues
+  std::vector<int2> ghost_atom_ranges;     ///< Atom index ranges for each ghost molecule
+};
+
+/// \brief Build a new topology combining base system and ghost molecules
+///
+/// Creates a new immutable AtomGraph that contains both the original system and multiple
+/// copies of a ghost molecule template. This is used for Grand Canonical Monte Carlo sampling
+/// where ghost molecules can be activated/deactivated during simulation.
+///
+/// \param base_topology         The original system topology
+/// \param ghost_template        Template containing single molecule to replicate as ghosts
+/// \param n_ghosts              Number of ghost copies to add
+/// \param ghost_residue_indices Output: residue indices of ghost molecules (optional)
+/// \param ghost_atom_ranges     Output: atom ranges for each ghost molecule (optional)
+/// \return New AtomGraph containing base system + ghost molecules
+AtomGraph buildTopologyWithGhosts(const AtomGraph& base_topology,
+                                  const AtomGraph& ghost_template,
+                                  int n_ghosts,
+                                  std::vector<int>* ghost_residue_indices = nullptr,
+                                  std::vector<int2>* ghost_atom_ranges = nullptr);
+
+/// \brief Build topology with ghosts from files
+///
+/// Convenience function that loads topologies from files and combines them.
+///
+/// \param base_topology_file    File path to base system topology
+/// \param ghost_template_file   File path to ghost molecule template
+/// \param n_ghosts              Number of ghost copies to add
+/// \param base_format           Format of base topology file
+/// \param ghost_format          Format of ghost template file
+/// \param ghost_residue_indices Output: residue indices of ghost molecules (optional)
+/// \param ghost_atom_ranges     Output: atom ranges for each ghost molecule (optional)
+/// \return New AtomGraph containing base system + ghost molecules
+AtomGraph buildTopologyWithGhostsFromFiles(const std::string& base_topology_file,
+                                           const std::string& ghost_template_file,
+                                           int n_ghosts,
+                                           TopologyKind base_format = TopologyKind::AMBER,
+                                           TopologyKind ghost_format = TopologyKind::AMBER,
+                                           std::vector<int>* ghost_residue_indices = nullptr,
+                                           std::vector<int2>* ghost_atom_ranges = nullptr);
+
+/// \brief Identify ghost molecules in a combined topology
+///
+/// Analyzes a combined topology to identify which molecules are ghosts based on
+/// the known base molecule count and expected number of ghosts.
+///
+/// \param combined_topology   The topology containing base + ghost molecules
+/// \param base_molecule_count Number of molecules in the original base topology
+/// \param n_ghosts            Number of ghost molecules that were added
+/// \return Metadata structure with ghost molecule information
+GhostMoleculeMetadata identifyGhostMolecules(const AtomGraph& combined_topology,
+                                             int base_molecule_count,
+                                             int n_ghosts);
+
+/// \brief Get ghost molecule indices
+///
+/// \param combined_topology   The combined topology
+/// \param base_molecule_count Number of base molecules
+/// \param n_ghosts            Number of ghost molecules
+/// \return Vector of molecule indices for ghost molecules
+std::vector<int> getGhostMoleculeIndices(const AtomGraph& combined_topology,
+                                         int base_molecule_count,
+                                         int n_ghosts);
+
+/// \brief Get atom ranges for ghost molecules
+///
+/// \param combined_topology      The combined topology
+/// \param ghost_molecule_indices Molecule indices of ghosts
+/// \return Vector of atom index ranges (int2: x=start, y=end)
+std::vector<int2> getGhostMoleculeAtomRanges(const AtomGraph& combined_topology,
+                                             const std::vector<int>& ghost_molecule_indices);
+
+/// \brief Create charge scaling factors for ghost molecules
+///
+/// Creates an array of scaling factors for partial charges, with ghost atoms
+/// scaled by initial_lambda and base atoms unscaled (1.0).
+///
+/// \param combined_topology The combined topology
+/// \param metadata          Ghost molecule metadata
+/// \param initial_lambda    Initial lambda value for ghosts (typically 0.0)
+/// \return Vector of scaling factors indexed by atom
+std::vector<double> createGhostChargeScalingFactors(const AtomGraph& combined_topology,
+                                                    const GhostMoleculeMetadata& metadata,
+                                                    double initial_lambda = 0.0);
+
+/// \brief Create VDW scaling factors for ghost molecules
+///
+/// Creates an array of scaling factors for van der Waals interactions, with ghost atoms
+/// scaled by initial_lambda and base atoms unscaled (1.0).
+///
+/// \param combined_topology The combined topology
+/// \param metadata          Ghost molecule metadata
+/// \param initial_lambda    Initial lambda value for ghosts (typically 0.0)
+/// \return Vector of scaling factors indexed by atom
+std::vector<double> createGhostVDWScalingFactors(const AtomGraph& combined_topology,
+                                                 const GhostMoleculeMetadata& metadata,
+                                                 double initial_lambda = 0.0);
+
+/// \brief Validate ghost topology consistency
+///
+/// Checks that the combined topology has the expected structure with base molecules
+/// followed by ghost molecules, and validates all metadata ranges.
+///
+/// \param combined_topology The combined topology to validate
+/// \param metadata          Ghost molecule metadata to validate against
+void validateGhostTopology(const AtomGraph& combined_topology,
+                           const GhostMoleculeMetadata& metadata);
+
 } // namespace topology
 } // namespace stormm
 

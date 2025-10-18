@@ -6,6 +6,7 @@
 #include "Constants/generalized_born.h"
 #include "Math/vector_ops.h"
 #include "Potential/energy_enumerators.h"
+#include "Potential/lambda_nonbonded.h"
 #include "Potential/nonbonded_potential.h"
 #include "Potential/scorecard.h"
 #include "Potential/static_exclusionmask.h"
@@ -65,6 +66,7 @@ using synthesis::SyAtomUpdateKit;
 using synthesis::SyValenceKit;
 using topology::AtomGraph;
 using topology::ImplicitSolventKit;
+using topology::LambdaNonbondedKit;
 using topology::NonbondedKit;
 using topology::UnitCellType;
 using topology::ValenceKit;
@@ -335,6 +337,50 @@ void evalRestrainedMMGB(PhaseSpace *ps, ScoreCard *sc, const AtomGraph *ag,
                         const StaticExclusionMask &se, const RestraintApparatus *ra,
                         EvaluateForce eval_force, int system_index = 0, int step = 0,
                         double clash_distance = 0.0, double clash_ratio = 0.0);
+/// \}
+
+/// \brief Evaluate MM/GBSA energy and forces with lambda-scaled non-bonded terms for GCMC/NCMC.
+///        Identical to evalRestrainedMMGB but uses lambda-aware nonbonded evaluation where
+///        per-atom lambda factors scale interaction strengths. Ghost atoms (lambda=0) are
+///        excluded from force calculations for correct alchemical thermodynamics.
+///
+/// Overloaded:
+///   - Take raw pointers to coordinates, box transformations, and forces, along with abstracts
+///     to the required parameters
+///   - Take a PhaseSpace object and the relevant topology plus restraint collection
+///
+/// Descriptions of input variables follow from evalRestrainedMMGB() above, with the key difference:
+///
+/// \param lambda_nbk   Lambda-aware non-bonded kit with per-atom coupling factors (lambda_vdw, lambda_ele)
+/// \param vdw_coupling_threshold  Lambda value where VDW finishes and electrostatics begins (typically 0.75)
+/// \{
+template <typename Tcoord, typename Tforce, typename Tcalc, typename Tcalc2, typename Tcalc4>
+void evalLambdaRestrainedMMGB(const Tcoord* xcrd, const Tcoord* ycrd, const Tcoord* zcrd,
+                              const double* umat, const double* invu, UnitCellType unit_cell,
+                              Tforce* xfrc, Tforce* yfrc, Tforce* zfrc, ScoreCard *sc,
+                              const ValenceKit<Tcalc> &vk,
+                              const LambdaNonbondedKit<Tcalc> &lambda_nbk,
+                              const StaticExclusionMaskReader &ser,
+                              const ImplicitSolventKit<Tcalc> &isk,
+                              const NeckGeneralizedBornKit<Tcalc> &neck_gbk,
+                              Tforce* effective_gb_radii, Tforce* psi, Tforce* sumdeijda,
+                              const RestraintKit<Tcalc, Tcalc2, Tcalc4> &rar,
+                              EvaluateForce eval_force, int system_index, int step,
+                              Tcalc inv_gpos_factor, Tcalc force_factor,
+                              Tcalc clash_distance, Tcalc clash_ratio,
+                              Tcalc vdw_coupling_threshold = 0.75, Tcalc softcore_alpha = 0.5);
+
+void evalLambdaRestrainedMMGB(PhaseSpaceWriter psw, ScoreCard *sc,
+                              const ValenceKit<double> &vk,
+                              const LambdaNonbondedKit<double> &lambda_nbk,
+                              const StaticExclusionMaskReader &ser,
+                              const ImplicitSolventKit<double> &isk,
+                              const NeckGeneralizedBornKit<double> &neck_gbk,
+                              double* effective_gb_radii, double* psi, double* sumdeijda,
+                              const RestraintKit<double, double2, double4> &rar,
+                              EvaluateForce eval_force, int system_index, int step,
+                              double clash_distance, double clash_ratio,
+                              double vdw_coupling_threshold = 0.75, double softcore_alpha = 0.5);
 /// \}
 
 /// \brief Initialize the appropriate energies in preparation for a loop over valence work units.

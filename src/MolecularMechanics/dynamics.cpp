@@ -27,7 +27,27 @@ void dynaStep(PhaseSpaceWriter *psw, ScoreCard *sc, const ThermostatWriter<doubl
                              psw->fzalt, sc, tstw, vk, nbk, isk, neck_gbk, effective_gb_radii, psi,
                              sumdeijda, rar, vsk, cdk, cnk, ser, dyncon, system_index);
 }
-  
+
+//-------------------------------------------------------------------------------------------------
+void lambdaDynaStep(PhaseSpaceWriter *psw, ScoreCard *sc, const ThermostatWriter<double> &tstw,
+                    const ValenceKit<double> &vk, const LambdaNonbondedKit<double> &lambda_nbk,
+                    const ImplicitSolventKit<double> &isk,
+                    const NeckGeneralizedBornKit<double> &neck_gbk, double* effective_gb_radii,
+                    double* psi, double* sumdeijda, const RestraintKit<double, double2, double4> &rar,
+                    const VirtualSiteKit<double> &vsk, const ChemicalDetailsKit &cdk,
+                    const ConstraintKit<double> &cnk, const StaticExclusionMaskReader &ser,
+                    const DynamicsControls &dyncon, const int system_index,
+                    const double vdw_coupling_threshold, const double softcore_alpha) {
+  lambdaDynaStep<double, double,
+                 double2, double4>(psw->xcrd, psw->ycrd, psw->zcrd, psw->xvel, psw->yvel,
+                                   psw->zvel, psw->xfrc, psw->yfrc, psw->zfrc, psw->xalt,
+                                   psw->yalt, psw->zalt, psw->vxalt, psw->vyalt, psw->vzalt,
+                                   psw->fxalt, psw->fyalt, psw->fzalt, sc, tstw, vk, lambda_nbk,
+                                   isk, neck_gbk, effective_gb_radii, psi, sumdeijda, rar, vsk,
+                                   cdk, cnk, ser, dyncon, system_index, 1.0, 1.0, 1.0,
+                                   vdw_coupling_threshold, softcore_alpha);
+}
+
 //-------------------------------------------------------------------------------------------------
 void dynamics(PhaseSpace *ps, Thermostat *heat_bath, ScoreCard *sc, const AtomGraph *ag,
               const NeckGeneralizedBornTable *neck_gbtab, const StaticExclusionMask *se,

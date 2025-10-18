@@ -19,7 +19,7 @@ void dynaStep(const Tcoord* xcrd, const Tcoord* ycrd, const Tcoord* zcrd, const 
               const DynamicsControls &dyncon, const int system_index,
               const Tcalc gpos_scale_factor, const Tcalc vel_scale_factor,
               const Tcalc frc_scale_factor) {
-  
+
   // Evaluate the force and energy for a system in vacuum with isolated boundary conditions
   evalRestrainedMMGB<Tcoord, Tcoord,
                      Tcalc, Tcalc2, Tcalc4>(xcrd, ycrd, zcrd, nullptr, nullptr, UnitCellType::NONE,
@@ -36,14 +36,14 @@ void dynaStep(const Tcoord* xcrd, const Tcoord* ycrd, const Tcoord* zcrd, const 
   const bool tcalc_is_double = (std::type_index(typeid(Tcalc)).hash_code() == double_type_index);
   const Tcalc* mass_ptr = (tcalc_is_double) ? reinterpret_cast<const Tcalc*>(cdk.masses) :
                                               reinterpret_cast<const Tcalc*>(cdk.sp_masses);
-  
+
   // Update the velocities by the first half step with the new forces.
   velocityVerletVelocityUpdate<Tcoord, Tcalc>(xvel, yvel, zvel, xfrc, yfrc, zfrc, cdk.natom,
                                               mass_ptr, vxalt, vyalt, vzalt, tstw, nullptr,
                                               nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
                                               nullptr, nullptr, 0, vel_scale_factor,
                                               frc_scale_factor);
-  
+
   // Constrain velocities
   if (tstw.cnst_geom) {
     rattleVelocities<Tcoord, Tcalc>(vxalt, vyalt, vzalt, xcrd, ycrd, zcrd, cnk, tstw.dt,
@@ -51,7 +51,104 @@ void dynaStep(const Tcoord* xcrd, const Tcoord* ycrd, const Tcoord* zcrd, const 
                                     dyncon.getCpuRattleMethod(), gpos_scale_factor,
                                     vel_scale_factor);
   }
-  
+
+  // Commit the energy, all components (energy computations are obligatory in CPU functions).  The
+  // diagnostics from the initial state will always be stored.
+  if (dyncon.getDiagnosticPrintFrequency() > 0 &&
+      tstw.step % dyncon.getDiagnosticPrintFrequency() == 0) {
+    evalKineticEnergy<Tcoord, Tcalc>(vxalt, vyalt, vzalt, sc, cdk, system_index,
+                                     static_cast<Tcalc>(1.0) / vel_scale_factor);
+    computeTemperature(sc, cdk, tstw.cnst_geom, system_index);
+    sc->commit(StateVariable::ALL_STATES, system_index);
+    sc->incrementSampleCount();
+    sc->setLastTimeStep(tstw.step);
+  }
+
+  // Move particles, placing their new positions in the {x,y,z}alt arrays.
+  velocityVerletCoordinateUpdate<Tcoord, Tcalc>(xcrd, ycrd, zcrd, xfrc, yfrc, zfrc, cdk.natom,
+                                                mass_ptr, xalt, yalt, zalt, vxalt, vyalt, vzalt,
+                                                tstw, nullptr, nullptr, nullptr, nullptr, nullptr,
+                                                nullptr, nullptr, nullptr, nullptr, nullptr,
+                                                nullptr, nullptr, 0, gpos_scale_factor,
+                                                vel_scale_factor, frc_scale_factor);
+
+  // Apply positional constraints
+  if (tstw.cnst_geom) {
+    shakePositions<Tcoord, Tcalc>(xalt, yalt, zalt, vxalt, vyalt, vzalt, xcrd, ycrd, zcrd, cnk,
+                                  tstw.dt, dyncon.getRattleTolerance(),
+                                  dyncon.getRattleIterations(), dyncon.getCpuRattleMethod(),
+                                  gpos_scale_factor, vel_scale_factor);
+  }
+
+  // Replace virtual sites
+  placeVirtualSites<Tcoord, Tcalc>(xalt, yalt, zalt, nullptr, nullptr, UnitCellType::NONE, vsk,
+                                   gpos_scale_factor);
+
+  // Zero forces in the alternate time point, in preparation for the next step.  Auxiliary arrays
+  // involved in Generalized Born calculations (psi, effective_gb_radii, sumdeijda) will be
+  // initialized in their respective CPU routines.
+  const Tcoord zero = 0.0;
+  for (int i = 0; i < cdk.natom; i++) {
+    fxalt[i] = zero;
+    fyalt[i] = zero;
+    fzalt[i] = zero;
+  }
+}
+
+//-------------------------------------------------------------------------------------------------
+template <typename Tcoord, typename Tcalc, typename Tcalc2, typename Tcalc4>
+void lambdaDynaStep(const Tcoord* xcrd, const Tcoord* ycrd, const Tcoord* zcrd, const Tcoord* xvel,
+                    const Tcoord* yvel, const Tcoord* zvel, Tcoord* xfrc, Tcoord* yfrc, Tcoord* zfrc,
+                    Tcoord* xalt, Tcoord* yalt, Tcoord* zalt, Tcoord* vxalt, Tcoord* vyalt,
+                    Tcoord* vzalt, Tcoord* fxalt, Tcoord* fyalt, Tcoord* fzalt, ScoreCard *sc,
+                    const ThermostatWriter<Tcalc> &tstw, const ValenceKit<Tcalc> &vk,
+                    const LambdaNonbondedKit<Tcalc> &lambda_nbk, const ImplicitSolventKit<Tcalc> &isk,
+                    const NeckGeneralizedBornKit<Tcalc> &neck_gbk, Tcoord* effective_gb_radii,
+                    Tcoord* psi, Tcoord* sumdeijda, const RestraintKit<Tcalc, Tcalc2, Tcalc4> &rar,
+                    const VirtualSiteKit<Tcalc> &vsk, const ChemicalDetailsKit &cdk,
+                    const ConstraintKit<Tcalc> &cnk, const StaticExclusionMaskReader &ser,
+                    const DynamicsControls &dyncon, const int system_index,
+                    const Tcalc gpos_scale_factor, const Tcalc vel_scale_factor,
+                    const Tcalc frc_scale_factor, const Tcalc vdw_coupling_threshold,
+                    const Tcalc softcore_alpha) {
+
+  // Evaluate the lambda-aware force and energy for a system in vacuum with isolated boundary conditions
+  evalLambdaRestrainedMMGB<Tcoord, Tcoord,
+                           Tcalc, Tcalc2, Tcalc4>(xcrd, ycrd, zcrd, nullptr, nullptr,
+                                                  UnitCellType::NONE, xfrc, yfrc, zfrc, sc, vk,
+                                                  lambda_nbk, ser, isk, neck_gbk, effective_gb_radii,
+                                                  psi, sumdeijda, rar, EvaluateForce::YES,
+                                                  system_index, tstw.step,
+                                                  static_cast<Tcalc>(1.0) / gpos_scale_factor,
+                                                  frc_scale_factor, static_cast<Tcalc>(0.0),
+                                                  static_cast<Tcalc>(0.0), vdw_coupling_threshold,
+                                                  softcore_alpha);
+  transmitVirtualSiteForces<Tcoord, Tcoord, Tcalc>(xcrd, ycrd, zcrd, xfrc, yfrc, zfrc, nullptr,
+                                                   nullptr, UnitCellType::NONE, vsk);
+
+  // Find the mass array that is amenable to the template.  This is not an ideal thing to do, but
+  // it will cast the float* array to Tcalc* if Tcalc is float and the double* array to Tcalc* if
+  // Tcalc is double.  This requirement is the legacy of ChemicalDetailsKit originally not
+  // containing the array of masses and therefore having no need to be templated in its own right.
+  const bool tcalc_is_double = (std::type_index(typeid(Tcalc)).hash_code() == double_type_index);
+  const Tcalc* mass_ptr = (tcalc_is_double) ? reinterpret_cast<const Tcalc*>(cdk.masses) :
+                                              reinterpret_cast<const Tcalc*>(cdk.sp_masses);
+
+  // Update the velocities by the first half step with the new forces.
+  velocityVerletVelocityUpdate<Tcoord, Tcalc>(xvel, yvel, zvel, xfrc, yfrc, zfrc, cdk.natom,
+                                              mass_ptr, vxalt, vyalt, vzalt, tstw, nullptr,
+                                              nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+                                              nullptr, nullptr, 0, vel_scale_factor,
+                                              frc_scale_factor);
+
+  // Constrain velocities
+  if (tstw.cnst_geom) {
+    rattleVelocities<Tcoord, Tcalc>(vxalt, vyalt, vzalt, xcrd, ycrd, zcrd, cnk, tstw.dt,
+                                    dyncon.getRattleTolerance(), dyncon.getRattleIterations(),
+                                    dyncon.getCpuRattleMethod(), gpos_scale_factor,
+                                    vel_scale_factor);
+  }
+
   // Commit the energy, all components (energy computations are obligatory in CPU functions).  The
   // diagnostics from the initial state will always be stored.
   if (dyncon.getDiagnosticPrintFrequency() > 0 &&

@@ -647,5 +647,56 @@ void evalRestrainedMMGB(const Tcoord* xcrd, const Tcoord* ycrd, const Tcoord* zc
                                                        inv_gpos_factor, force_factor);
 }
 
+//-------------------------------------------------------------------------------------------------
+template <typename Tcoord, typename Tforce, typename Tcalc, typename Tcalc2, typename Tcalc4>
+void evalLambdaRestrainedMMGB(const Tcoord* xcrd, const Tcoord* ycrd, const Tcoord* zcrd,
+                              const double* umat, const double* invu, const UnitCellType unit_cell,
+                              Tforce* xfrc, Tforce* yfrc, Tforce* zfrc, ScoreCard *sc,
+                              const ValenceKit<Tcalc> &vk,
+                              const LambdaNonbondedKit<Tcalc> &lambda_nbk,
+                              const StaticExclusionMaskReader &ser,
+                              const ImplicitSolventKit<Tcalc> &isk,
+                              const NeckGeneralizedBornKit<Tcalc> &neck_gbk,
+                              Tforce* effective_gb_radii, Tforce* psi, Tforce* sumdeijda,
+                              const RestraintKit<Tcalc, Tcalc2, Tcalc4> &rar,
+                              const EvaluateForce eval_force, const int system_index, const int step,
+                              const Tcalc inv_gpos_factor, const Tcalc force_factor,
+                              const Tcalc clash_distance, const Tcalc clash_ratio,
+                              const Tcalc vdw_coupling_threshold, const Tcalc softcore_alpha) {
+
+  // Use lambda-aware nonbonded evaluation (NEW!)
+  energy::evaluateLambdaNonbondedEnergy<Tcoord, Tforce, Tcalc>(
+      lambda_nbk, ser, xcrd, ycrd, zcrd, umat, invu, unit_cell, xfrc, yfrc, zfrc, sc,
+      eval_force, EvaluateEnergy::YES, system_index, inv_gpos_factor, force_factor,
+      clash_distance, clash_ratio, vdw_coupling_threshold, softcore_alpha);
+
+  // Create standard NonbondedKit view for valence/GB evaluation
+  // (Valence 1-4 terms and GB use original parameters, not lambda-scaled)
+  const NonbondedKit<Tcalc> nbk(
+      lambda_nbk.natom, lambda_nbk.n_q_types, lambda_nbk.n_lj_types,
+      lambda_nbk.coulomb_constant, lambda_nbk.charge, lambda_nbk.q_idx, lambda_nbk.lj_idx,
+      lambda_nbk.q_parameter, lambda_nbk.lja_coeff, lambda_nbk.ljb_coeff, lambda_nbk.ljc_coeff,
+      lambda_nbk.lja_14_coeff, lambda_nbk.ljb_14_coeff, lambda_nbk.ljc_14_coeff,
+      lambda_nbk.lj_sigma, lambda_nbk.lj_14_sigma, lambda_nbk.nb11x, lambda_nbk.nb11_bounds,
+      lambda_nbk.nb12x, lambda_nbk.nb12_bounds, lambda_nbk.nb13x, lambda_nbk.nb13_bounds,
+      lambda_nbk.nb14x, lambda_nbk.nb14_bounds, lambda_nbk.lj_type_corr);
+
+  // Valence terms (unchanged - use standard nbk)
+  evalValeMM<Tcoord, Tforce, Tcalc>(xcrd, ycrd, zcrd, umat, invu, unit_cell, xfrc, yfrc, zfrc,
+                                    sc, vk, nbk, eval_force, system_index, inv_gpos_factor,
+                                    force_factor, clash_distance, clash_ratio);
+
+  // GB implicit solvent (unchanged - use standard nbk)
+  evaluateGeneralizedBornEnergy<Tcoord, Tforce, Tcalc>(
+      nbk, ser, isk, neck_gbk, xcrd, ycrd, zcrd, xfrc, yfrc, zfrc,
+      effective_gb_radii, psi, sumdeijda, sc, eval_force, system_index,
+      inv_gpos_factor, force_factor);
+
+  // Restraints (unchanged)
+  evaluateRestraints<Tcoord, Tforce, Tcalc, Tcalc2, Tcalc4>(
+      rar, xcrd, ycrd, zcrd, umat, invu, unit_cell, xfrc, yfrc, zfrc,
+      sc, eval_force, system_index, step, inv_gpos_factor, force_factor);
+}
+
 } // namespace mm
 } // namespace stormm

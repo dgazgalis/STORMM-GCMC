@@ -1070,5 +1070,207 @@ std::vector<int2> findMoleculeOrder(const std::vector<AtomGraph*> &agv,
   return result;
 }
 
+//-------------------------------------------------------------------------------------------------
+AtomGraph buildTopologyWithGhosts(const AtomGraph& base_topology,
+                                  const AtomGraph& ghost_template,
+                                  int n_ghosts,
+                                  std::vector<int>* ghost_residue_indices,
+                                  std::vector<int2>* ghost_atom_ranges) {
+  // Handle fragment-only mode where base topology is empty
+  const bool fragment_only = (base_topology.getAtomCount() == 0);
+
+  AtomGraph combined;
+
+  if (fragment_only) {
+    // Fragment-only mode: just use n_ghosts copies of the template
+    std::vector<AtomGraph*> agv = {const_cast<AtomGraph*>(&ghost_template)};
+    std::vector<int> counts = {n_ghosts};
+    combined = AtomGraph(agv, counts, MoleculeOrdering::RETAIN_ORDER, ExceptionResponse::WARN);
+  } else {
+    // Normal mode: combine base + n_ghosts copies of the template
+    std::vector<AtomGraph*> agv = {
+      const_cast<AtomGraph*>(&base_topology),
+      const_cast<AtomGraph*>(&ghost_template)
+    };
+    std::vector<int> counts = {1, n_ghosts};
+    combined = AtomGraph(agv, counts, MoleculeOrdering::RETAIN_ORDER, ExceptionResponse::WARN);
+  }
+
+  // Fill in ghost metadata if requested
+  if (ghost_residue_indices != nullptr || ghost_atom_ranges != nullptr) {
+    const int base_molecule_count = base_topology.getMoleculeCount();
+    const int base_residue_count = base_topology.getResidueCount();
+    const int base_atom_count = base_topology.getAtomCount();
+
+    if (ghost_residue_indices != nullptr) {
+      ghost_residue_indices->clear();
+      ghost_residue_indices->reserve(n_ghosts);
+      for (int i = 0; i < n_ghosts; i++) {
+        // Ghost residue indices start after base residues
+        const int ghost_res_start = base_residue_count + (i * ghost_template.getResidueCount());
+        ghost_residue_indices->push_back(ghost_res_start);
+      }
+    }
+
+    if (ghost_atom_ranges != nullptr) {
+      ghost_atom_ranges->clear();
+      ghost_atom_ranges->reserve(n_ghosts);
+      const int template_atom_count = ghost_template.getAtomCount();
+      for (int i = 0; i < n_ghosts; i++) {
+        const int ghost_atom_start = base_atom_count + (i * template_atom_count);
+        const int ghost_atom_end = ghost_atom_start + template_atom_count;
+        ghost_atom_ranges->push_back({ghost_atom_start, ghost_atom_end});
+      }
+    }
+  }
+
+  return combined;
+}
+
+//-------------------------------------------------------------------------------------------------
+AtomGraph buildTopologyWithGhostsFromFiles(const std::string& base_topology_file,
+                                           const std::string& ghost_template_file,
+                                           int n_ghosts,
+                                           TopologyKind base_format,
+                                           TopologyKind ghost_format,
+                                           std::vector<int>* ghost_residue_indices,
+                                           std::vector<int2>* ghost_atom_ranges) {
+  // Load topologies from files
+  AtomGraph base_topology(base_topology_file, ExceptionResponse::WARN, base_format);
+  AtomGraph ghost_template(ghost_template_file, ExceptionResponse::WARN, ghost_format);
+
+  // Use the main function to build combined topology
+  return buildTopologyWithGhosts(base_topology, ghost_template, n_ghosts,
+                                ghost_residue_indices, ghost_atom_ranges);
+}
+
+//-------------------------------------------------------------------------------------------------
+GhostMoleculeMetadata identifyGhostMolecules(const AtomGraph& combined_topology,
+                                             int base_molecule_count,
+                                             int n_ghosts) {
+  GhostMoleculeMetadata metadata;
+
+  metadata.n_ghost_molecules = n_ghosts;
+  metadata.base_molecule_count = base_molecule_count;
+
+  // Get base counts from molecule limits
+  if (base_molecule_count > 0) {
+    const int2 last_base_mol_limits = combined_topology.getMoleculeLimits(base_molecule_count - 1);
+    metadata.base_atom_count = last_base_mol_limits.y;
+    metadata.base_residue_count = combined_topology.getResidueIndex(metadata.base_atom_count - 1) + 1;
+  } else {
+    metadata.base_atom_count = 0;
+    metadata.base_residue_count = 0;
+  }
+
+  // Fill in ghost molecule information
+  metadata.ghost_molecule_indices.reserve(n_ghosts);
+  metadata.ghost_residue_indices.reserve(n_ghosts);
+  metadata.ghost_atom_ranges.reserve(n_ghosts);
+
+  for (int i = 0; i < n_ghosts; i++) {
+    const int ghost_mol_idx = base_molecule_count + i;
+    const int2 mol_limits = combined_topology.getMoleculeLimits(ghost_mol_idx);
+    const int res_idx = combined_topology.getResidueIndex(mol_limits.x);
+
+    metadata.ghost_molecule_indices.push_back(ghost_mol_idx);
+    metadata.ghost_residue_indices.push_back(res_idx);
+    metadata.ghost_atom_ranges.push_back(mol_limits);
+  }
+
+  return metadata;
+}
+
+//-------------------------------------------------------------------------------------------------
+std::vector<int> getGhostMoleculeIndices(const AtomGraph& combined_topology,
+                                         int base_molecule_count,
+                                         int n_ghosts) {
+  std::vector<int> indices;
+  indices.reserve(n_ghosts);
+  for (int i = 0; i < n_ghosts; i++) {
+    indices.push_back(base_molecule_count + i);
+  }
+  return indices;
+}
+
+//-------------------------------------------------------------------------------------------------
+std::vector<int2> getGhostMoleculeAtomRanges(const AtomGraph& combined_topology,
+                                             const std::vector<int>& ghost_molecule_indices) {
+  std::vector<int2> ranges;
+  ranges.reserve(ghost_molecule_indices.size());
+  for (int mol_idx : ghost_molecule_indices) {
+    ranges.push_back(combined_topology.getMoleculeLimits(mol_idx));
+  }
+  return ranges;
+}
+
+//-------------------------------------------------------------------------------------------------
+std::vector<double> createGhostChargeScalingFactors(const AtomGraph& combined_topology,
+                                                    const GhostMoleculeMetadata& metadata,
+                                                    double initial_lambda) {
+  const int n_atoms = combined_topology.getAtomCount();
+  std::vector<double> scaling_factors(n_atoms, 1.0);
+
+  // Scale ghost atom charges by initial lambda (typically 0.0)
+  for (const int2& atom_range : metadata.ghost_atom_ranges) {
+    for (int atom_idx = atom_range.x; atom_idx < atom_range.y; atom_idx++) {
+      scaling_factors[atom_idx] = initial_lambda;
+    }
+  }
+
+  return scaling_factors;
+}
+
+//-------------------------------------------------------------------------------------------------
+std::vector<double> createGhostVDWScalingFactors(const AtomGraph& combined_topology,
+                                                 const GhostMoleculeMetadata& metadata,
+                                                 double initial_lambda) {
+  const int n_atoms = combined_topology.getAtomCount();
+  std::vector<double> scaling_factors(n_atoms, 1.0);
+
+  // Scale ghost atom VDW by initial lambda (typically 0.0)
+  for (const int2& atom_range : metadata.ghost_atom_ranges) {
+    for (int atom_idx = atom_range.x; atom_idx < atom_range.y; atom_idx++) {
+      scaling_factors[atom_idx] = initial_lambda;
+    }
+  }
+
+  return scaling_factors;
+}
+
+//-------------------------------------------------------------------------------------------------
+void validateGhostTopology(const AtomGraph& combined_topology,
+                           const GhostMoleculeMetadata& metadata) {
+  // Validate molecule counts
+  const int expected_total_molecules = metadata.base_molecule_count + metadata.n_ghost_molecules;
+  if (combined_topology.getMoleculeCount() != expected_total_molecules) {
+    rtErr("Ghost topology has " + std::to_string(combined_topology.getMoleculeCount()) +
+          " molecules, expected " + std::to_string(expected_total_molecules),
+          "validateGhostTopology");
+  }
+
+  // Validate atom ranges
+  for (size_t i = 0; i < metadata.ghost_atom_ranges.size(); i++) {
+    const int2& range = metadata.ghost_atom_ranges[i];
+    if (range.x < metadata.base_atom_count || range.x >= combined_topology.getAtomCount()) {
+      rtErr("Ghost molecule " + std::to_string(i) + " has invalid atom range start: " +
+            std::to_string(range.x), "validateGhostTopology");
+    }
+    if (range.y <= range.x || range.y > combined_topology.getAtomCount()) {
+      rtErr("Ghost molecule " + std::to_string(i) + " has invalid atom range end: " +
+            std::to_string(range.y), "validateGhostTopology");
+    }
+  }
+
+  // Validate residue indices
+  for (size_t i = 0; i < metadata.ghost_residue_indices.size(); i++) {
+    const int res_idx = metadata.ghost_residue_indices[i];
+    if (res_idx < metadata.base_residue_count || res_idx >= combined_topology.getResidueCount()) {
+      rtErr("Ghost molecule " + std::to_string(i) + " has invalid residue index: " +
+            std::to_string(res_idx), "validateGhostTopology");
+    }
+  }
+}
+
 } // namespace topology
 } // namespace stormm
