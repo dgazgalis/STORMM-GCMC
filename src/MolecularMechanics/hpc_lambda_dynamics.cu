@@ -10,6 +10,7 @@
 #include "Potential/cacheresource.h"
 #include "Potential/scorecard.h"
 #include "Trajectory/thermostat.h"
+#include "Trajectory/trajectory_enumerators.h"
 #include "Synthesis/atomgraph_synthesis.h"
 #include "Synthesis/phasespace_synthesis.h"
 #include "Synthesis/implicit_solvent_workspace.h"
@@ -22,6 +23,7 @@ namespace stormm {
 namespace mm {
 
 using card::CoreKlManager;
+using card::Hybrid;
 using card::HybridTargetLevel;
 using energy::EvaluateForce;
 using energy::EvaluateEnergy;
@@ -32,35 +34,39 @@ using energy::PrecisionModel;
 using synthesis::AtomGraphSynthesis;
 using synthesis::ISWorkspaceKit;
 using synthesis::PhaseSpaceSynthesis;
+using synthesis::PsSynthesisWriter;
+using synthesis::SeMaskSynthesisReader;
+using synthesis::SyNonbondedKit;
 using synthesis::StaticExclusionMaskSynthesis;
 using synthesis::VwuGoal;
+using trajectory::CoordinateCycle;
 
 
 //-------------------------------------------------------------------------------------------------
-// GPU kernel: Zero force arrays
+// GPU kernel: Zero force arrays (llint* fixed-precision version)
 //-------------------------------------------------------------------------------------------------
 __global__ void kZeroForces(
     const int n_atoms,
-    double* __restrict__ fx,
-    double* __restrict__ fy,
-    double* __restrict__ fz)
+    llint* __restrict__ fx,
+    llint* __restrict__ fy,
+    llint* __restrict__ fz)
 {
   const int idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (idx >= n_atoms) return;
 
-  fx[idx] = 0.0;
-  fy[idx] = 0.0;
-  fz[idx] = 0.0;
+  fx[idx] = 0LL;
+  fy[idx] = 0LL;
+  fz[idx] = 0LL;
 }
 
 //-------------------------------------------------------------------------------------------------
-// Launch wrapper for zeroing forces
+// Launch wrapper for zeroing forces (llint* version)
 //-------------------------------------------------------------------------------------------------
 void launchZeroForces(
     int n_atoms,
-    double* fx,
-    double* fy,
-    double* fz)
+    llint* fx,
+    llint* fy,
+    llint* fz)
 {
   const int threads_per_block = 256;
   const int num_blocks = (n_atoms + threads_per_block - 1) / threads_per_block;
@@ -74,10 +80,13 @@ void launchZeroForces(
 }
 
 //-------------------------------------------------------------------------------------------------
-// Complete GPU velocity Verlet MD step with lambda-scaled forces and full integration
+// DEPRECATED: Complete GPU velocity Verlet MD step with lambda-scaled forces and full integration
 //
-// This function performs a complete MD cycle using STORMM's standard MOVE_PARTICLES integration
-// mode, which automatically handles:
+// NOTE: This old function used double* arrays and is no longer used.
+// Use launchLambdaDynamicsStep() instead, which works with llint* fixed-precision.
+//
+// This function performed a complete MD cycle using STORMM's standard MOVE_PARTICLES integration
+// mode, which automatically handled:
 //   - Velocity Verlet integration (both half-steps)
 //   - SETTLE constraints (rigid water geometries)
 //   - RATTLE constraints (general bond constraints)
@@ -108,6 +117,7 @@ void launchZeroForces(
 //       * Intramolecular energies cancel in GCMC acceptance criteria
 //       * Only intermolecular (nonbonded) interactions need lambda-scaling
 //-------------------------------------------------------------------------------------------------
+/*
 void launchGpuLambdaDynamicsStep(
     int n_atoms,
     int n_coupled,
@@ -146,129 +156,84 @@ void launchGpuLambdaDynamicsStep(
     synthesis::ImplicitSolventWorkspace* gb_workspace,
     topology::ImplicitSolventModel gb_model)
 {
-  // Step 1: Zero forces before computing new forces
-  // This ensures we start with clean force arrays for the new MD step
-  launchZeroForces(n_atoms, xfrc, yfrc, zfrc);
+  // DEPRECATED - Function body removed
+  // Use launchLambdaDynamicsStep() instead
+}
+*/
 
-  // Step 2: Compute Born radii (if GB enabled)
-  // Born radii are computed for ALL atoms (no lambda scaling) to maintain proper geometry
-  if (gb_workspace != nullptr && gb_model != topology::ImplicitSolventModel::NONE) {
-    const HybridTargetLevel tier = HybridTargetLevel::DEVICE;
+//-------------------------------------------------------------------------------------------------
+void launchLambdaDynamicsStep(
+    const double* lambda_vdw,
+    const double* lambda_ele,
+    const int* coupled_indices,
+    int n_coupled,
+    const AtomGraphSynthesis& poly_ag,
+    const StaticExclusionMaskSynthesis& poly_se,
+    trajectory::Thermostat* tst,
+    PhaseSpaceSynthesis* poly_ps,
+    MolecularMechanicsControls* mmctrl,
+    energy::ScoreCard* sc,
+    const CoreKlManager& launcher,
+    energy::CacheResource* valence_cache,
+    energy::CacheResource* nonb_cache,
+    EvaluateEnergy eval_energy,
+    synthesis::ImplicitSolventWorkspace* gb_workspace,
+    topology::ImplicitSolventModel gb_model)
+{
+  using card::HybridTargetLevel;
+  using synthesis::PsSynthesisWriter;
 
-    // Get GB parameters from topology
-    const synthesis::SyNonbondedKit<double, double2> nbk =
-        poly_ag->getDoublePrecisionNonbondedKit(tier);
+  const HybridTargetLevel devc_tier = HybridTargetLevel::DEVICE;
+  const int n_atoms = poly_ag.getAtomCount();
 
-    // NOTE: ISWorkspaceKit stores fixed-precision (llint*) but lambda GB functions expect double*
-    // The lambda GB kernels will need to manage their own double-precision storage
-    // or we need to extend ISWorkspaceKit to include double* born_radii arrays
+  // Get current cycle position for coordinate/force access (needed for zeroing forces)
+  const CoordinateCycle curr_cyc = poly_ps->getCyclePosition();
+  PsSynthesisWriter psw = poly_ps->data(curr_cyc, devc_tier);
 
-    // Call lambda-aware Born radii kernel
-    // Pass nullptr for psi and born_radii - kernel will handle its own storage
-    energy::launchLambdaBornRadii(
-        n_atoms,
-        xcrd, ycrd, zcrd,
-        nbk.pb_radii,        // Perfect Born radii from topology
-        nbk.gb_screen,       // Screening parameters from topology
-        nbk.gb_offset,       // GB offset parameter
-        nullptr,             // psi values (kernel manages internally)
-        nullptr,             // Born radii output (kernel manages internally)
-        gb_workspace,
-        gb_model);
-  }
+  // Zero forces before computing new forces
+  const int threads_per_block = 256;
+  const int num_blocks = (n_atoms + threads_per_block - 1) / threads_per_block;
+  kZeroForces<<<num_blocks, threads_per_block>>>(n_atoms, psw.xfrc, psw.yfrc, psw.zfrc);
 
-  // Step 3: Compute nonbonded forces with lambda scaling
-  // GB pairwise interactions are included in the lambda nonbonded kernel
-  energy::launchLambdaScaledNonbonded(
-      n_atoms, n_coupled, coupled_indices,
-      xcrd, ycrd, zcrd,
-      charges, lambda_vdw, lambda_ele,
-      atom_sigma, atom_epsilon,
-      exclusion_mask, supertile_map, tile_map, supertile_stride,
-      umat, unit_cell, coulomb_const,
-      ewald_coeff,
-      per_atom_elec, per_atom_vdw,
-      xfrc, yfrc, zfrc,
-      gb_workspace,  // Pass GB workspace for pairwise GB calculations
-      gb_model);     // Pass GB model to enable GB pairwise terms
+  // Call high-level lambda nonbonded launcher (matches standard dynamics pattern)
+  // This extracts coordinates/forces internally from PhaseSpaceSynthesis
+  energy::launchLambdaNonbonded(
+      lambda_vdw,                       // Per-atom VDW lambda (device array)
+      lambda_ele,                       // Per-atom electrostatic lambda (device array)
+      coupled_indices,                  // Indices of coupled atoms (device array)
+      n_coupled,                        // Number of coupled atoms
+      constants::PrecisionModel::DOUBLE,  // Precision model
+      poly_ag,                          // Topology synthesis
+      poly_se,                          // Static exclusion mask synthesis
+      mmctrl,                           // MM controls
+      poly_ps,                          // Phase space synthesis (coordinates, velocities, forces)
+      nullptr,                          // Thermostat (not used in lambda nonbonded)
+      sc,                               // Score card for energy tracking
+      nonb_cache,                       // Cache resource for nonbonded kernel
+      gb_workspace,                     // GB workspace (nullptr if GB disabled)
+      EvaluateForce::YES,               // We need forces computed
+      eval_energy,                      // Energy evaluation (only on diagnostic steps)
+      launcher);                        // Kernel launch manager
 
-  // Step 3: Compute valence forces + perform full Velocity Verlet integration
-  //
-  // This single call does EVERYTHING needed for a complete MD step:
-  //   - Computes bonded forces (bonds, angles, dihedrals, impropers)
-  //   - Adds them to the nonbonded forces computed above
-  //   - Performs first velocity half-update: v(t) -> v(t+dt/2) using F(t)
-  //   - Updates coordinates: x(t) -> x(t+dt) using v(t+dt/2)
-  //   - Applies SETTLE/RATTLE constraints to coordinates and velocities
-  //   - Updates virtual site positions based on frame atoms
-  //   - Recomputes forces at new positions x(t+dt) (triggers constraint force redistribution)
-  //   - Performs second velocity half-update: v(t+dt/2) -> v(t+dt) using F(t+dt)
-  //   - Applies thermostat velocity scaling if thermostat != nullptr
-  //
-  // CRITICAL: We use VwuGoal::MOVE_PARTICLES mode (not ACCUMULATE) to enable full integration.
-  // The nonbonded forces are already in the force arrays from Step 2. The valence kernel will
-  // ADD bonded forces, then perform the full integration cycle including constraints and
-  // virtual sites.
-  //
-  // NOTE: The valence kernel will recompute ALL forces (nonbonded + valence) at the new
-  // positions x(t+dt) as part of the MOVE_PARTICLES workflow. This is necessary for correct
-  // constraint force redistribution. To avoid duplicate nonbonded calculations, we would need
-  // to integrate the lambda-scaled nonbonded kernel into the MOVE_PARTICLES workflow, but
-  // that would require modifying STORMM's core valence kernel. For now, we accept this
-  // inefficiency in exchange for correctness.
-  //
-  // TODO: Future optimization - integrate lambda nonbonded into MOVE_PARTICLES workflow
-
+  // Call valence kernel to:
+  // 1. Compute bonded forces (NOT lambda-scaled - correct for GCMC)
+  // 2. Perform full Velocity Verlet integration with constraints
+  // 3. Apply thermostat if present
   launchValence(
       PrecisionModel::DOUBLE,           // Match coordinate/force precision
-      *poly_ag,                          // Topology synthesis with constraints/virtual sites
-      mmctrl,                            // MM controls (timestep, counters, integration mode)
-      poly_ps,                           // Phase space synthesis (coordinates, velocities, forces)
-      thermostat,                        // Thermostat (nullptr = NVE, otherwise NVT with scaling)
-      sc,                                // Score card for energy tracking (nullptr = skip)
-      valence_cache,                     // Thread-block cache resource for temporary storage
+      poly_ag,                           // Topology synthesis
+      mmctrl,                            // MM controls (timestep, integration mode)
+      poly_ps,                           // Phase space synthesis
+      tst,                               // Thermostat (nullptr = NVE)
+      sc,                                // Score card for energy tracking
+      valence_cache,                     // Thread-block cache resource
       EvaluateForce::YES,                // We need forces computed
       eval_energy,                       // Energy evaluation (only on diagnostic steps)
-      VwuGoal::MOVE_PARTICLES,           // CRITICAL: Full integration mode with constraints
-      *launcher,                         // Kernel launch parameters (block/thread counts)
+      VwuGoal::MOVE_PARTICLES,           // CRITICAL: Full integration mode
+      launcher,                          // Kernel launch parameters
       0.0,                               // clash_distance (no clash mitigation)
       0.0);                              // clash_ratio (no clash mitigation)
-
-  // Step 5: Apply Born derivative forces if GB is enabled
-  // Born derivatives ARE lambda-scaled (critical for GCMC physics)
-  if (gb_workspace != nullptr && gb_model != topology::ImplicitSolventModel::NONE) {
-    const HybridTargetLevel tier = HybridTargetLevel::DEVICE;
-
-    // Get GB parameters from topology
-    const synthesis::SyNonbondedKit<double, double2> nbk =
-        poly_ag->getDoublePrecisionNonbondedKit(tier);
-
-    // NOTE: ISWorkspaceKit stores fixed-precision (llint*) but lambda GB functions expect double*
-    // The lambda GB kernels will need to manage their own double-precision storage
-    // or we need to extend ISWorkspaceKit to include double* sum_deijda arrays
-
-    // Call lambda-aware Born derivative kernel
-    // Pass nullptr for born_radii and sum_deijda - kernel will handle storage
-    energy::launchLambdaBornDerivatives(
-        n_atoms,
-        n_coupled,
-        coupled_indices,
-        xcrd, ycrd, zcrd,
-        charges,
-        lambda_ele,
-        nullptr,             // Born radii (kernel manages internally)
-        nullptr,             // sum_deijda (kernel manages internally)
-        nbk.gb_offset,       // GB offset parameter
-        coulomb_const,
-        xfrc, yfrc, zfrc,    // Add forces to existing arrays
-        gb_workspace,
-        gb_model);
-  }
-
-  // Synchronization is handled by STORMM's kernel infrastructure
-  // No explicit cudaDeviceSynchronize() needed here
 }
-
 
 } // namespace mm
 } // namespace stormm

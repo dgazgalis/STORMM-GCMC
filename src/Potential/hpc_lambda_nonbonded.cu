@@ -1,21 +1,42 @@
 // -*-c++-*-
 #include "copyright.h"
 #include <cuda_runtime.h>
+#include "Accelerator/core_kernel_manager.h"
 #include "Accelerator/hybrid.h"
 #include "Constants/behavior.h"
 #include "DataTypes/common_types.h"
+#include "MolecularMechanics/mm_controls.h"
+#include "Potential/cacheresource.h"
+#include "Potential/scorecard.h"
+#include "Synthesis/atomgraph_synthesis.h"
 #include "Synthesis/implicit_solvent_workspace.h"
+#include "Synthesis/phasespace_synthesis.h"
+#include "Synthesis/static_mask_synthesis.h"
 #include "Topology/atomgraph_enumerators.h"
+#include "Trajectory/thermostat.h"
+#include "Trajectory/trajectory_enumerators.h"
 #include "hpc_lambda_nonbonded.h"
 
 namespace stormm {
 namespace energy {
 
+using card::CoreKlManager;
+using card::Hybrid;
 using card::HybridTargetLevel;
+using card::PrecisionModel;
+using mm::MolecularMechanicsControls;
+using synthesis::AtomGraphSynthesis;
 using synthesis::ImplicitSolventWorkspace;
 using synthesis::ISWorkspaceKit;
+using synthesis::PhaseSpaceSynthesis;
+using synthesis::PsSynthesisWriter;
+using synthesis::SeMaskSynthesisReader;
+using synthesis::StaticExclusionMaskSynthesis;
+using synthesis::SyNonbondedKit;
 using topology::ImplicitSolventModel;
 using topology::UnitCellType;
+using trajectory::CoordinateCycle;
+using trajectory::Thermostat;
 
 /// \brief Threshold for lambda coupling - atoms below this are fully decoupled
 constexpr double LAMBDA_GHOST_THRESHOLD = 0.01;
@@ -34,14 +55,15 @@ __global__ void kLambdaScaledNonbonded(
     const int n_atoms,
     const int n_coupled,
     const int* __restrict__ coupled_indices,
-    const double* __restrict__ xcrd,
-    const double* __restrict__ ycrd,
-    const double* __restrict__ zcrd,
+    const llint* __restrict__ xcrd,
+    const llint* __restrict__ ycrd,
+    const llint* __restrict__ zcrd,
     const double* __restrict__ charges,
     const double* __restrict__ lambda_vdw,
     const double* __restrict__ lambda_ele,
-    const double* __restrict__ atom_sigma,
-    const double* __restrict__ atom_epsilon,
+    const int* __restrict__ lj_idx,
+    const int n_lj_types,
+    const double2* __restrict__ ljab_coeff,
     const uint* __restrict__ exclusion_mask,
     const int* __restrict__ supertile_map,
     const int* __restrict__ tile_map,
@@ -50,11 +72,13 @@ __global__ void kLambdaScaledNonbonded(
     const UnitCellType unit_cell,
     const double coulomb_const,
     const double ewald_coeff,  // Ewald coefficient for PME direct space
+    const float inv_gpos_scale,
+    const float frc_scale,
     double* __restrict__ output_elec,
     double* __restrict__ output_vdw,
-    double* __restrict__ xfrc,  // Force outputs (NULL for energy-only mode)
-    double* __restrict__ yfrc,
-    double* __restrict__ zfrc,
+    llint* __restrict__ xfrc,  // Force outputs (NULL for energy-only mode)
+    llint* __restrict__ yfrc,
+    llint* __restrict__ zfrc,
     const double* __restrict__ born_radii,    // Born radii from GB workspace (NULL if GB disabled)
     const double gb_kappa,                    // GB salt screening parameter
     const double gb_offset,                   // GB offset parameter
@@ -69,14 +93,13 @@ __global__ void kLambdaScaledNonbonded(
   const int i = coupled_indices[tid];
 
   // Load atom i properties
-  const double xi = xcrd[i];
-  const double yi = ycrd[i];
-  const double zi = zcrd[i];
+  const double xi = (double)(xcrd[i]) * inv_gpos_scale;
+  const double yi = (double)(ycrd[i]) * inv_gpos_scale;
+  const double zi = (double)(zcrd[i]) * inv_gpos_scale;
   const double qi = charges[i];
   const double lambda_vdw_i = lambda_vdw[i];
   const double lambda_ele_i = lambda_ele[i];
-  const double sigma_i = atom_sigma[i];
-  const double epsilon_i = atom_epsilon[i];
+  const int lj_type_i = lj_idx[i];
 
   // Accumulate energies and forces for this atom
   double elec_sum = 0.0;
@@ -91,19 +114,20 @@ __global__ void kLambdaScaledNonbonded(
   const int tile_length = 16;
 
   // OPTIMIZATION: Loop over coupled atoms only (not all atoms)
-  // This changes from O(N_coupled × N_total) to O(N_coupled²)
-  // Skips all Coupled-Ghost interactions which contribute ~0
+  // This changes from O(N_coupled × N_total) to O(N_coupled²/2)
+  // Each pair (i,j) computed exactly once using atom index comparison
   for (int j_tid = 0; j_tid < n_coupled; j_tid++) {
     // Get actual atom index for coupled atom j
     const int j = coupled_indices[j_tid];
 
+    // Skip self-interaction
     if (i == j) continue;
 
-    // Avoid double counting: only process each pair once
-    // Since coupled_indices is sorted, use i < j
-    if (i > j) continue;
+    // Skip pairs where j >= i to avoid double-counting
+    // Each unique pair (i,j) is computed by exactly one thread (the one with smaller atom index)
+    if (j >= i) continue;
 
-    // Check exclusion mask
+    // Compute tile indices for exclusion mask lookup
     const int sti = i / supertile_length;
     const int stj = j / supertile_length;
     const int ti = (i % supertile_length) / tile_length;
@@ -119,14 +143,13 @@ __global__ void kLambdaScaledNonbonded(
     if ((mask_i >> local_j) & 0x1) continue;
 
     // Load atom j properties
-    const double xj = xcrd[j];
-    const double yj = ycrd[j];
-    const double zj = zcrd[j];
+    const double xj = (double)(xcrd[j]) * inv_gpos_scale;
+    const double yj = (double)(ycrd[j]) * inv_gpos_scale;
+    const double zj = (double)(zcrd[j]) * inv_gpos_scale;
     const double qj = charges[j];
     const double lambda_vdw_j = lambda_vdw[j];
     const double lambda_ele_j = lambda_ele[j];
-    const double sigma_j = atom_sigma[j];
-    const double epsilon_j = atom_epsilon[j];
+    const int lj_type_j = lj_idx[j];
 
     // Compute distance with PBC
     double dx = xj - xi;
@@ -185,40 +208,47 @@ __global__ void kLambdaScaledNonbonded(
       }
     }
 
-    // VDW energy with softcore
-    const double sigma = 0.5 * (sigma_i + sigma_j);
-    const double epsilon = sqrt(epsilon_i * epsilon_j);
+    // VDW energy with softcore using STORMM native LJ parameters
+    // Standard STORMM pattern: ij_ljidx = lj_idx[j] + lj_idx[i] * n_lj_types
+    const int ij_ljidx = lj_type_j + lj_type_i * n_lj_types;
+    const double2 ljab = ljab_coeff[ij_ljidx];
+    const double lja = ljab.x;  // A coefficient (r^-12 repulsive term)
+    const double ljb = ljab.y;  // B coefficient (r^-6 attractive term)
     const double lambda_ij_vdw = lambda_vdw_i * lambda_vdw_j;
 
-    if (epsilon > 1.0e-10 && lambda_ij_vdw > 1.0e-10) {
-      // Softcore potential
+    if ((fabs(lja) > 1.0e-10 || fabs(ljb) > 1.0e-10) && lambda_ij_vdw > 1.0e-10) {
+      // STORMM uses: U = lja/r^12 - ljb/r^6 (standard Lennard-Jones form)
+      // For softcore, we use r_eff instead of r
       const double one_minus_lambda = 1.0 - lambda_ij_vdw;
       const double r6 = r2 * r2 * r2;
-      const double sigma2 = sigma * sigma;
-      const double sigma6 = sigma2 * sigma2 * sigma2;
-      const double r_eff6 = r6 + SOFTCORE_ALPHA * sigma6 * one_minus_lambda;
+
+      // Softcore offset uses ljb coefficient to estimate sigma
+      // Since ljb ~ epsilon * sigma^6, we can estimate the characteristic scale
+      // For simplicity, use ljb as the characteristic scale
+      const double r_eff6 = r6 + SOFTCORE_ALPHA * fabs(ljb) * one_minus_lambda;
 
       const double inv_r_eff6 = 1.0 / r_eff6;
       const double inv_r_eff12 = inv_r_eff6 * inv_r_eff6;
 
-      const double sigma12 = sigma6 * sigma6;
-      const double lj_energy = 4.0 * epsilon * (sigma12 * inv_r_eff12 - sigma6 * inv_r_eff6);
+      // FIX: Swap powers to match STORMM convention: A/r^12 - B/r^6
+      const double lj_energy = lja * inv_r_eff12 - ljb * inv_r_eff6;
 
       vdw_sum += lambda_ij_vdw * lj_energy;
 
       if (compute_forces) {
         // Softcore force: F = -dU/dr
-        // dU/dr = lambda * d/dr[4*eps*(sig^12/r_eff^12 - sig^6/r_eff^6)]
-        // For softcore: d(r_eff^6)/dr = 6*r^5
-        // dU/dr = lambda * 4*eps * [-12*sig^12/(r_eff^13) + 6*sig^6/(r_eff^7)] * 6*r^5/(2*r_eff^6)
-        //       = lambda * 24*eps*r^5 * [sig^6/r_eff^7 - 2*sig^12/r_eff^13]
+        // For U = lja/r_eff^6 - ljb/r_eff^12
+        // dU/dr = -6*lja/r_eff^7 * dr_eff/dr + 12*ljb/r_eff^13 * dr_eff/dr
+        // For r_eff^6 = r^6 + offset: dr_eff/dr = 6*r^5 / (2*r_eff^6)
         const double r5 = r2 * r2 * r;
-        const double inv_r_eff7 = inv_r_eff6 / r_eff6;   // 1/r_eff^12
-        const double inv_r_eff13 = inv_r_eff12 / r_eff6; // 1/r_eff^18
+        const double inv_r_eff7 = inv_r_eff6 / r_eff6;   // Actually 1/(r_eff^6)^2 = 1/r_eff^12
+        const double inv_r_eff13 = inv_r_eff12 / r_eff6; // Actually 1/(r_eff^6)^3 = 1/r_eff^18
 
-        // More accurate form matching the softcore potential derivative
-        const double fmag = lambda_ij_vdw * 24.0 * epsilon * r5 *
-                           (sigma6 * inv_r_eff7 - 2.0 * sigma12 * inv_r_eff13);
+        // Corrected derivative with proper chain rule for softcore
+        // F·r = lambda * 6*r^5 * (-6*lja*inv_r_eff^7 + 12*ljb*inv_r_eff^13) / (2*r_eff^6)
+        //     = lambda * 3*r^5 * (-6*lja*inv_r_eff^7 + 12*ljb*inv_r_eff^13) / r_eff^6
+        const double fmag = lambda_ij_vdw * 3.0 * r5 *
+                           (-6.0 * lja * inv_r_eff7 + 12.0 * ljb * inv_r_eff13) / r_eff6;
 
         const double invr = 1.0 / r;
         fx_sum += fmag * dx * invr;
@@ -289,9 +319,9 @@ __global__ void kLambdaScaledNonbonded(
 
   // Accumulate forces using atomic operations (multiple threads may access same atom)
   if (compute_forces) {
-    atomicAdd(&xfrc[i], fx_sum);
-    atomicAdd(&yfrc[i], fy_sum);
-    atomicAdd(&zfrc[i], fz_sum);
+    atomicAdd((ullint*)&xfrc[i], (ullint)(__double2ll_rn(fx_sum * frc_scale)));
+    atomicAdd((ullint*)&yfrc[i], (ullint)(__double2ll_rn(fy_sum * frc_scale)));
+    atomicAdd((ullint*)&zfrc[i], (ullint)(__double2ll_rn(fz_sum * frc_scale)));
   }
 }
 
@@ -362,12 +392,13 @@ __global__ void kUpdateLambdaFromSchedule(
 //-------------------------------------------------------------------------------------------------
 __global__ void kLambdaBornRadii(
     const int n_atoms,
-    const double* __restrict__ xcrd,
-    const double* __restrict__ ycrd,
-    const double* __restrict__ zcrd,
+    const llint* __restrict__ xcrd,
+    const llint* __restrict__ ycrd,
+    const llint* __restrict__ zcrd,
     const double* __restrict__ pb_radii,      // Perfect Born radii from topology
     const double* __restrict__ gb_screen,     // Screening parameters
     const double gb_offset,                   // GB offset parameter
+    const float inv_gpos_scale,
     double* __restrict__ psi,                  // Output psi values for Born radii calculation
     double* __restrict__ born_radii)          // Output Born radii
 {
@@ -378,9 +409,9 @@ __global__ void kLambdaBornRadii(
   double psi_sum = 0.0;
 
   // Get atom i properties
-  const double xi = xcrd[i];
-  const double yi = ycrd[i];
-  const double zi = zcrd[i];
+  const double xi = (double)(xcrd[i]) * inv_gpos_scale;
+  const double yi = (double)(ycrd[i]) * inv_gpos_scale;
+  const double zi = (double)(zcrd[i]) * inv_gpos_scale;
   const double pb_radius_i = pb_radii[i];
   const double screen_i = gb_screen[i];
 
@@ -389,9 +420,9 @@ __global__ void kLambdaBornRadii(
     if (i == j) continue;
 
     // Get atom j properties
-    const double xj = xcrd[j];
-    const double yj = ycrd[j];
-    const double zj = zcrd[j];
+    const double xj = (double)(xcrd[j]) * inv_gpos_scale;
+    const double yj = (double)(ycrd[j]) * inv_gpos_scale;
+    const double zj = (double)(zcrd[j]) * inv_gpos_scale;
     const double pb_radius_j = pb_radii[j];
     const double screen_j = gb_screen[j];
 
@@ -440,18 +471,20 @@ __global__ void kLambdaBornDerivatives(
     const int n_atoms,
     const int n_coupled,
     const int* __restrict__ coupled_indices,
-    const double* __restrict__ xcrd,
-    const double* __restrict__ ycrd,
-    const double* __restrict__ zcrd,
+    const llint* __restrict__ xcrd,
+    const llint* __restrict__ ycrd,
+    const llint* __restrict__ zcrd,
     const double* __restrict__ charges,
     const double* __restrict__ lambda_ele,    // For lambda scaling
     const double* __restrict__ born_radii,
     const double* __restrict__ sum_deijda,    // Derivative of GB energy w.r.t. Born radii
     const double gb_offset,
     const double coulomb_const,
-    double* __restrict__ xfrc,
-    double* __restrict__ yfrc,
-    double* __restrict__ zfrc)
+    const float inv_gpos_scale,
+    const float frc_scale,
+    llint* __restrict__ xfrc,
+    llint* __restrict__ yfrc,
+    llint* __restrict__ zfrc)
 {
   const int tid = blockIdx.x * blockDim.x + threadIdx.x;
   if (tid >= n_coupled) return;
@@ -460,9 +493,9 @@ __global__ void kLambdaBornDerivatives(
   const int i = coupled_indices[tid];
 
   // Load atom i properties
-  const double xi = xcrd[i];
-  const double yi = ycrd[i];
-  const double zi = zcrd[i];
+  const double xi = (double)(xcrd[i]) * inv_gpos_scale;
+  const double yi = (double)(ycrd[i]) * inv_gpos_scale;
+  const double zi = (double)(zcrd[i]) * inv_gpos_scale;
   const double qi = charges[i];
   const double lambda_i = lambda_ele[i];
   const double born_radius_i = born_radii[i];
@@ -474,14 +507,17 @@ __global__ void kLambdaBornDerivatives(
   double fz_sum = 0.0;
 
   // Loop over all coupled atoms for pairwise contributions
+  // Use atom index comparison to avoid double-counting
   for (int j_tid = 0; j_tid < n_coupled; j_tid++) {
     const int j = coupled_indices[j_tid];
     if (i == j) continue;
+    // Skip pairs where j >= i to avoid double-counting
+    if (j >= i) continue;
 
     // Load atom j properties
-    const double xj = xcrd[j];
-    const double yj = ycrd[j];
-    const double zj = zcrd[j];
+    const double xj = (double)(xcrd[j]) * inv_gpos_scale;
+    const double yj = (double)(ycrd[j]) * inv_gpos_scale;
+    const double zj = (double)(zcrd[j]) * inv_gpos_scale;
     const double qj = charges[j];
     const double lambda_j = lambda_ele[j];
     const double born_radius_j = born_radii[j];
@@ -528,9 +564,9 @@ __global__ void kLambdaBornDerivatives(
   }
 
   // Add forces to global arrays using atomic operations
-  atomicAdd(&xfrc[i], fx_sum);
-  atomicAdd(&yfrc[i], fy_sum);
-  atomicAdd(&zfrc[i], fz_sum);
+  atomicAdd((ullint*)&xfrc[i], (ullint)(__double2ll_rn(fx_sum * frc_scale)));
+  atomicAdd((ullint*)&yfrc[i], (ullint)(__double2ll_rn(fy_sum * frc_scale)));
+  atomicAdd((ullint*)&zfrc[i], (ullint)(__double2ll_rn(fz_sum * frc_scale)));
 }
 
 //-------------------------------------------------------------------------------------------------
@@ -566,20 +602,55 @@ __global__ void kSumEnergies(
 }
 
 //-------------------------------------------------------------------------------------------------
+/// \brief GPU kernel to write lambda-scaled nonbonded energies to ScoreCard
+///
+/// This kernel takes GPU-reduced scalar energies and writes them directly to the ScoreCard
+/// using atomic operations, matching the standard STORMM pattern used by valence and nonbonded
+/// kernels. This ensures proper synchronization when multiple kernels contribute energies.
+///
+/// \param elec_energy      Electrostatic energy (already GPU-reduced to single scalar)
+/// \param vdw_energy       VDW energy (already GPU-reduced to single scalar)
+/// \param scw              ScoreCard writer for GPU-side atomic accumulation
+/// \param system_id        System index (0 for single-system GCMC)
+//-------------------------------------------------------------------------------------------------
+__global__ void kWriteEnergiesToScoreCard(
+    const double* elec_energy,
+    const double* vdw_energy,
+    ScoreCardWriter scw,
+    int system_id)
+{
+  // Only one thread writes (kernel launched with <<<1, 1>>>)
+  if (threadIdx.x == 0 && blockIdx.x == 0) {
+    // Convert double energies to fixed-precision llint
+    const llint elec_scaled = __double2ll_rn(elec_energy[0] * scw.nrg_scale_f);
+    const llint vdw_scaled = __double2ll_rn(vdw_energy[0] * scw.nrg_scale_f);
+
+    // Calculate indices in ScoreCard accumulator array
+    const int elec_idx = (system_id * scw.data_stride) + (int)(StateVariable::ELECTROSTATIC);
+    const int vdw_idx = (system_id * scw.data_stride) + (int)(StateVariable::VDW);
+
+    // Atomic write to ScoreCard (GPU-side, matches valence/nonbonded pattern)
+    atomicAdd((ullint*)&scw.instantaneous_accumulators[elec_idx], (ullint)(elec_scaled));
+    atomicAdd((ullint*)&scw.instantaneous_accumulators[vdw_idx], (ullint)(vdw_scaled));
+  }
+}
+
+//-------------------------------------------------------------------------------------------------
 // Launch wrapper for the lambda-scaled nonbonded kernel
 //-------------------------------------------------------------------------------------------------
 void launchLambdaScaledNonbonded(
     int n_atoms,
     int n_coupled,
     const int* coupled_indices,
-    const double* xcrd,
-    const double* ycrd,
-    const double* zcrd,
+    const llint* xcrd,
+    const llint* ycrd,
+    const llint* zcrd,
     const double* charges,
     const double* lambda_vdw,
     const double* lambda_ele,
-    const double* atom_sigma,
-    const double* atom_epsilon,
+    const int* lj_idx,
+    int n_lj_types,
+    const double2* ljab_coeff,
     const uint* exclusion_mask,
     const int* supertile_map,
     const int* tile_map,
@@ -588,11 +659,13 @@ void launchLambdaScaledNonbonded(
     UnitCellType unit_cell,
     double coulomb_const,
     double ewald_coeff,
+    float inv_gpos_scale,
+    float frc_scale,
     double* output_elec,
     double* output_vdw,
-    double* xfrc,  // nullptr for energy-only mode
-    double* yfrc,
-    double* zfrc,
+    llint* xfrc,  // nullptr for energy-only mode
+    llint* yfrc,
+    llint* zfrc,
     synthesis::ImplicitSolventWorkspace* gb_workspace,
     topology::ImplicitSolventModel gb_model)
 {
@@ -630,9 +703,10 @@ void launchLambdaScaledNonbonded(
       n_atoms, n_coupled, coupled_indices,
       xcrd, ycrd, zcrd, charges,
       lambda_vdw, lambda_ele,
-      atom_sigma, atom_epsilon,
+      lj_idx, n_lj_types, ljab_coeff,
       exclusion_mask, supertile_map, tile_map, supertile_stride,
       umat, unit_cell, coulomb_const, ewald_coeff,
+      inv_gpos_scale, frc_scale,
       output_elec, output_vdw,
       xfrc, yfrc, zfrc,
       born_radii, gb_kappa, gb_offset, gb_model);
@@ -652,14 +726,15 @@ void launchLambdaScaledNonbondedWithReduction(
     int n_atoms,
     int n_coupled,
     const int* coupled_indices,
-    const double* xcrd,
-    const double* ycrd,
-    const double* zcrd,
+    const llint* xcrd,
+    const llint* ycrd,
+    const llint* zcrd,
     const double* charges,
     const double* lambda_vdw,
     const double* lambda_ele,
-    const double* atom_sigma,
-    const double* atom_epsilon,
+    const int* lj_idx,
+    int n_lj_types,
+    const double2* ljab_coeff,
     const uint* exclusion_mask,
     const int* supertile_map,
     const int* tile_map,
@@ -668,13 +743,15 @@ void launchLambdaScaledNonbondedWithReduction(
     UnitCellType unit_cell,
     double coulomb_const,
     double ewald_coeff,
+    float inv_gpos_scale,
+    float frc_scale,
     double* per_atom_elec,      // Device arrays for intermediate results
     double* per_atom_vdw,
     double* total_elec_out,     // Device scalar output
     double* total_vdw_out,      // Device scalar output
-    double* xfrc,               // nullptr for energy-only mode
-    double* yfrc,
-    double* zfrc,
+    llint* xfrc,               // nullptr for energy-only mode
+    llint* yfrc,
+    llint* zfrc,
     synthesis::ImplicitSolventWorkspace* gb_workspace,
     topology::ImplicitSolventModel gb_model)
 {
@@ -713,9 +790,10 @@ void launchLambdaScaledNonbondedWithReduction(
       n_atoms, n_coupled, coupled_indices,
       xcrd, ycrd, zcrd, charges,
       lambda_vdw, lambda_ele,
-      atom_sigma, atom_epsilon,
+      lj_idx, n_lj_types, ljab_coeff,
       exclusion_mask, supertile_map, tile_map, supertile_stride,
       umat, unit_cell, coulomb_const, ewald_coeff,
+      inv_gpos_scale, frc_scale,
       per_atom_elec, per_atom_vdw,
       xfrc, yfrc, zfrc,
       born_radii, gb_kappa, gb_offset, gb_model);
@@ -791,12 +869,13 @@ void launchUpdateLambdaFromSchedule(
 //-------------------------------------------------------------------------------------------------
 void launchLambdaBornRadii(
     int n_atoms,
-    const double* xcrd,
-    const double* ycrd,
-    const double* zcrd,
+    const llint* xcrd,
+    const llint* ycrd,
+    const llint* zcrd,
     const double* pb_radii,
     const double* gb_screen,
     double gb_offset,
+    float inv_gpos_scale,
     double* psi,
     double* born_radii,
     synthesis::ImplicitSolventWorkspace* gb_workspace,
@@ -811,6 +890,7 @@ void launchLambdaBornRadii(
   kLambdaBornRadii<<<num_blocks, threads_per_block>>>(
       n_atoms, xcrd, ycrd, zcrd,
       pb_radii, gb_screen, gb_offset,
+      inv_gpos_scale,
       psi, born_radii);
 
   cudaError_t err = cudaGetLastError();
@@ -827,18 +907,20 @@ void launchLambdaBornDerivatives(
     int n_atoms,
     int n_coupled,
     const int* coupled_indices,
-    const double* xcrd,
-    const double* ycrd,
-    const double* zcrd,
+    const llint* xcrd,
+    const llint* ycrd,
+    const llint* zcrd,
     const double* charges,
     const double* lambda_ele,
     const double* born_radii,
     const double* sum_deijda,
     double gb_offset,
     double coulomb_const,
-    double* xfrc,
-    double* yfrc,
-    double* zfrc,
+    float inv_gpos_scale,
+    float frc_scale,
+    llint* xfrc,
+    llint* yfrc,
+    llint* zfrc,
     synthesis::ImplicitSolventWorkspace* gb_workspace,
     topology::ImplicitSolventModel gb_model)
 {
@@ -852,11 +934,149 @@ void launchLambdaBornDerivatives(
       n_atoms, n_coupled, coupled_indices,
       xcrd, ycrd, zcrd, charges, lambda_ele,
       born_radii, sum_deijda, gb_offset, coulomb_const,
+      inv_gpos_scale, frc_scale,
       xfrc, yfrc, zfrc);
 
   cudaError_t err = cudaGetLastError();
   if (err != cudaSuccess) {
     // Error occurred - STORMM will handle it
+  }
+}
+
+//================================================================================================
+// HIGH-LEVEL LAMBDA NONBONDED LAUNCHER (matching standard dynamics pattern)
+//================================================================================================
+
+//-------------------------------------------------------------------------------------------------
+// High-level launcher that matches launchNonbonded() from hpc_nonbonded_potential.cu
+// This extracts coordinate/force pointers internally from PhaseSpaceSynthesis just like
+// the standard dynamics does.
+//-------------------------------------------------------------------------------------------------
+void launchLambdaNonbonded(
+    const double* lambda_vdw,
+    const double* lambda_ele,
+    const int* coupled_indices,
+    int n_coupled,
+    constants::PrecisionModel prec,
+    const AtomGraphSynthesis& poly_ag,
+    const StaticExclusionMaskSynthesis& poly_se,
+    MolecularMechanicsControls* mmctrl,
+    PhaseSpaceSynthesis* poly_ps,
+    Thermostat* heat_bath,
+    ScoreCard* sc,
+    CacheResource* tb_space,
+    ImplicitSolventWorkspace* ism_space,
+    EvaluateForce eval_force,
+    EvaluateEnergy eval_energy,
+    const CoreKlManager& launcher)
+{
+  using card::HybridTargetLevel;
+  using synthesis::PsSynthesisWriter;
+  using synthesis::SeMaskSynthesisReader;
+  using synthesis::SyNonbondedKit;
+  using topology::UnitCellType;
+
+  const HybridTargetLevel tier = HybridTargetLevel::DEVICE;
+  const int n_atoms = poly_ag.getAtomCount();
+
+  // Get current cycle position for coordinate/force access
+  const CoordinateCycle curr_cyc = poly_ps->getCyclePosition();
+  PsSynthesisWriter psw = poly_ps->data(curr_cyc, tier);
+
+  // Get exclusion mask reader (DEVICE tier for kernel)
+  const SeMaskSynthesisReader poly_ser = poly_se.data(tier);
+
+  // Get nonbonded parameters (DEVICE tier for kernel)
+  const SyNonbondedKit<double, double2> nbk = poly_ag.getDoublePrecisionNonbondedKit(tier);
+
+  // FIX: Get HOST-tier abstracts for reading scalars on CPU
+  const SeMaskSynthesisReader poly_ser_host = poly_se.data(HybridTargetLevel::HOST);
+  const SyNonbondedKit<double, double2> nbk_host =
+      poly_ag.getDoublePrecisionNonbondedKit(HybridTargetLevel::HOST);
+
+  // Get unit cell info
+  const UnitCellType unit_cell = poly_ps->getUnitCellType();
+  const double ewald_coeff = (unit_cell != UnitCellType::NONE) ? 0.35 : 0.0;
+  const double coulomb_const = poly_ag.getCoulombConstant();
+
+  // FIX: Read scalars from HOST-tier abstracts (system 0 for single-system GCMC)
+  const int system_id = 0;  // GCMC typically operates on single system
+  const int supertile_stride = poly_ser_host.atom_counts[system_id];
+  const int n_lj_types = nbk_host.n_lj_types[system_id];
+  const int lj_offset = nbk_host.ljabc_offsets[system_id];
+
+  // Extract LJ parameters from topology (STORMM native convention)
+  // Use DEVICE-tier pointers for passing to kernel
+  const int* lj_idx_ptr = nbk.lj_idx;
+  // FIX: Offset ljab_coeff by system's LJ parameter table offset
+  const double2* ljab_coeff_ptr = nbk.ljab_coeff + lj_offset;
+
+  // Per-atom energy arrays for GPU-side reduction
+  Hybrid<double> per_atom_elec(n_coupled, "per_atom_elec");
+  Hybrid<double> per_atom_vdw(n_coupled, "per_atom_vdw");
+  per_atom_elec.upload();
+  per_atom_vdw.upload();
+
+  // Device scalars for GPU-reduced total energies
+  Hybrid<double> total_elec_dev(1, "total_elec_reduced");
+  Hybrid<double> total_vdw_dev(1, "total_vdw_reduced");
+  total_elec_dev.upload();
+  total_vdw_dev.upload();
+
+  // Get implicit solvent model
+  const ImplicitSolventModel gb_model = poly_ag.getImplicitSolventModel();
+
+  // Call lambda-scaled nonbonded kernel WITH GPU reduction to get scalar totals
+  // This eliminates CPU-side reduction and only downloads 2 scalars instead of n_coupled values
+  launchLambdaScaledNonbondedWithReduction(
+      n_atoms,
+      n_coupled,
+      coupled_indices,
+      psw.xcrd,                    // llint* coordinates (fixed-precision)
+      psw.ycrd,
+      psw.zcrd,
+      nbk.charge,                  // Charges from topology
+      lambda_vdw,
+      lambda_ele,
+      lj_idx_ptr,                  // LJ type indices from topology
+      n_lj_types,                  // Number of LJ types
+      ljab_coeff_ptr,              // LJ A/B coefficients from topology
+      poly_ser.mask_data,
+      poly_ser.supertile_map_idx,
+      poly_ser.tile_map_idx,
+      supertile_stride,
+      psw.umat,
+      unit_cell,
+      coulomb_const,
+      ewald_coeff,
+      psw.inv_gpos_scale,          // Coordinate scaling factor
+      psw.frc_scale,               // Force scaling factor
+      per_atom_elec.data(tier),    // Device per-atom arrays (intermediate)
+      per_atom_vdw.data(tier),
+      total_elec_dev.data(tier),   // Device scalar outputs (GPU-reduced)
+      total_vdw_dev.data(tier),
+      psw.xfrc,                    // llint* forces (fixed-precision)
+      psw.yfrc,
+      psw.zfrc,
+      ism_space,
+      gb_model);
+
+  // Only write energies to ScoreCard if energy evaluation was requested
+  if (eval_energy == EvaluateEnergy::YES) {
+    // Extract ScoreCardWriter for GPU-side atomic writes (matches standard STORMM pattern)
+    ScoreCardWriter scw = sc->data(tier);
+
+    // Launch GPU kernel to write energies directly to ScoreCard
+    // This uses atomic operations to accumulate energies, ensuring proper synchronization
+    // with other kernels (valence, PME, etc.) that also write to the same ScoreCard
+    const int system_id = 0;  // Single-system GCMC
+    kWriteEnergiesToScoreCard<<<1, 1>>>(
+        total_elec_dev.data(tier),  // GPU-side scalar (already reduced)
+        total_vdw_dev.data(tier),   // GPU-side scalar (already reduced)
+        scw,                        // ScoreCardWriter for atomic accumulation
+        system_id);                 // System index
+
+    // No CPU-side download or contribute() needed - kernel writes directly to GPU ScoreCard!
   }
 }
 

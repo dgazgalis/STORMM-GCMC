@@ -3,13 +3,31 @@
 #define STORMM_HPC_LAMBDA_NONBONDED_H
 
 #include "copyright.h"
+#include "Constants/behavior.h"
 #include "DataTypes/common_types.h"
+#include "Potential/energy_enumerators.h"
 #include "Topology/atomgraph_enumerators.h"
 
 // Forward declarations
 namespace stormm {
+namespace card {
+  class CoreKlManager;
+}
+namespace energy {
+  class CacheResource;
+  class ScoreCard;
+}
+namespace mm {
+  class MolecularMechanicsControls;
+}
 namespace synthesis {
+  class AtomGraphSynthesis;
   class ImplicitSolventWorkspace;
+  class PhaseSpaceSynthesis;
+  class StaticExclusionMaskSynthesis;
+}
+namespace trajectory {
+  class Thermostat;
 }
 }
 
@@ -34,8 +52,9 @@ using topology::UnitCellType;
 /// \param charges           Partial charges (device array, size n_atoms)
 /// \param lambda_vdw        Per-atom VDW lambda (device array, size n_atoms)
 /// \param lambda_ele        Per-atom electrostatic lambda (device array, size n_atoms)
-/// \param atom_sigma        Per-atom LJ sigma (device array, size n_atoms)
-/// \param atom_epsilon      Per-atom LJ epsilon (device array, size n_atoms)
+/// \param lj_idx            Lennard-Jones type indices (device array, size n_atoms)
+/// \param n_lj_types        Number of LJ types
+/// \param ljab_coeff        LJ A/B coefficients (device array, size n_lj_types^2)
 /// \param exclusion_mask    Exclusion mask data (device array)
 /// \param supertile_map     Supertile map indices (device array)
 /// \param tile_map          Tile map indices (device array)
@@ -55,14 +74,15 @@ void launchLambdaScaledNonbonded(
     int n_atoms,
     int n_coupled,
     const int* coupled_indices,
-    const double* xcrd,
-    const double* ycrd,
-    const double* zcrd,
+    const llint* xcrd,
+    const llint* ycrd,
+    const llint* zcrd,
     const double* charges,
     const double* lambda_vdw,
     const double* lambda_ele,
-    const double* atom_sigma,
-    const double* atom_epsilon,
+    const int* lj_idx,
+    int n_lj_types,
+    const double2* ljab_coeff,
     const uint* exclusion_mask,
     const int* supertile_map,
     const int* tile_map,
@@ -71,11 +91,13 @@ void launchLambdaScaledNonbonded(
     UnitCellType unit_cell,
     double coulomb_const,
     double ewald_coeff,
+    float inv_gpos_scale,
+    float frc_scale,
     double* output_elec,
     double* output_vdw,
-    double* xfrc = nullptr,
-    double* yfrc = nullptr,
-    double* zfrc = nullptr,
+    llint* xfrc = nullptr,
+    llint* yfrc = nullptr,
+    llint* zfrc = nullptr,
     synthesis::ImplicitSolventWorkspace* gb_workspace = nullptr,
     topology::ImplicitSolventModel gb_model = topology::ImplicitSolventModel::NONE);
 
@@ -94,8 +116,9 @@ void launchLambdaScaledNonbonded(
 /// \param charges           Partial charges (device array)
 /// \param lambda_vdw        Per-atom VDW lambda (device array)
 /// \param lambda_ele        Per-atom electrostatic lambda (device array)
-/// \param atom_sigma        Per-atom LJ sigma (device array)
-/// \param atom_epsilon      Per-atom LJ epsilon (device array)
+/// \param lj_idx            Lennard-Jones type indices (device array, size n_atoms)
+/// \param n_lj_types        Number of LJ types
+/// \param ljab_coeff        LJ A/B coefficients (device array, size n_lj_types^2)
 /// \param exclusion_mask    Exclusion mask data (device array)
 /// \param supertile_map     Supertile map indices (device array)
 /// \param tile_map          Tile map indices (device array)
@@ -117,14 +140,15 @@ void launchLambdaScaledNonbondedWithReduction(
     int n_atoms,
     int n_coupled,
     const int* coupled_indices,
-    const double* xcrd,
-    const double* ycrd,
-    const double* zcrd,
+    const llint* xcrd,
+    const llint* ycrd,
+    const llint* zcrd,
     const double* charges,
     const double* lambda_vdw,
     const double* lambda_ele,
-    const double* atom_sigma,
-    const double* atom_epsilon,
+    const int* lj_idx,
+    int n_lj_types,
+    const double2* ljab_coeff,
     const uint* exclusion_mask,
     const int* supertile_map,
     const int* tile_map,
@@ -133,13 +157,15 @@ void launchLambdaScaledNonbondedWithReduction(
     UnitCellType unit_cell,
     double coulomb_const,
     double ewald_coeff,
+    float inv_gpos_scale,
+    float frc_scale,
     double* per_atom_elec,
     double* per_atom_vdw,
     double* total_elec_out,
     double* total_vdw_out,
-    double* xfrc = nullptr,
-    double* yfrc = nullptr,
-    double* zfrc = nullptr,
+    llint* xfrc = nullptr,
+    llint* yfrc = nullptr,
+    llint* zfrc = nullptr,
     synthesis::ImplicitSolventWorkspace* gb_workspace = nullptr,
     topology::ImplicitSolventModel gb_model = topology::ImplicitSolventModel::NONE);
 
@@ -200,12 +226,13 @@ void launchUpdateLambdaFromSchedule(
 /// \param gb_model        Implicit solvent model
 void launchLambdaBornRadii(
     int n_atoms,
-    const double* xcrd,
-    const double* ycrd,
-    const double* zcrd,
+    const llint* xcrd,
+    const llint* ycrd,
+    const llint* zcrd,
     const double* pb_radii,
     const double* gb_screen,
     double gb_offset,
+    float inv_gpos_scale,
     double* psi,
     double* born_radii,
     synthesis::ImplicitSolventWorkspace* gb_workspace,
@@ -237,20 +264,67 @@ void launchLambdaBornDerivatives(
     int n_atoms,
     int n_coupled,
     const int* coupled_indices,
-    const double* xcrd,
-    const double* ycrd,
-    const double* zcrd,
+    const llint* xcrd,
+    const llint* ycrd,
+    const llint* zcrd,
     const double* charges,
     const double* lambda_ele,
     const double* born_radii,
     const double* sum_deijda,
     double gb_offset,
     double coulomb_const,
-    double* xfrc,
-    double* yfrc,
-    double* zfrc,
+    float inv_gpos_scale,
+    float frc_scale,
+    llint* xfrc,
+    llint* yfrc,
+    llint* zfrc,
     synthesis::ImplicitSolventWorkspace* gb_workspace,
     topology::ImplicitSolventModel gb_model);
+
+//================================================================================================
+// HIGH-LEVEL LAMBDA NONBONDED LAUNCHERS (matching standard dynamics pattern)
+//================================================================================================
+// These high-level launchers match the launchNonbonded() pattern from hpc_nonbonded_potential.h
+// They take STORMM objects and extract internal pointers/abstracts automatically.
+
+/// \brief High-level lambda nonbonded launcher matching standard dynamics pattern
+///
+/// This function matches the launchNonbonded signature but adds lambda scaling parameters.
+/// It extracts coordinate/force pointers internally from PhaseSpaceSynthesis.
+///
+/// \param lambda_vdw        Per-atom VDW lambda array (device, size n_atoms)
+/// \param lambda_ele        Per-atom electrostatic lambda array (device, size n_atoms)
+/// \param coupled_indices   Indices of coupled atoms (device array)
+/// \param n_coupled         Number of coupled atoms
+/// \param prec              Precision model (DOUBLE or SINGLE)
+/// \param poly_ag           Topology synthesis
+/// \param poly_se           Static exclusion mask synthesis
+/// \param mmctrl            Molecular mechanics controls
+/// \param poly_ps           Phase space synthesis (coordinates, velocities, forces)
+/// \param heat_bath         Thermostat (nullptr for NVE)
+/// \param sc                Score card for energy tracking
+/// \param tb_space          Cache resource for thread blocks
+/// \param ism_space         Implicit solvent workspace
+/// \param eval_force        Whether to evaluate forces
+/// \param eval_energy       Whether to evaluate energies
+/// \param launcher          Kernel launch manager
+void launchLambdaNonbonded(
+    const double* lambda_vdw,
+    const double* lambda_ele,
+    const int* coupled_indices,
+    int n_coupled,
+    constants::PrecisionModel prec,
+    const synthesis::AtomGraphSynthesis& poly_ag,
+    const synthesis::StaticExclusionMaskSynthesis& poly_se,
+    mm::MolecularMechanicsControls* mmctrl,
+    synthesis::PhaseSpaceSynthesis* poly_ps,
+    trajectory::Thermostat* heat_bath,
+    ScoreCard* sc,
+    energy::CacheResource* tb_space,
+    synthesis::ImplicitSolventWorkspace* ism_space,
+    EvaluateForce eval_force,
+    EvaluateEnergy eval_energy,
+    const card::CoreKlManager& launcher);
 
 } // namespace energy
 } // namespace stormm

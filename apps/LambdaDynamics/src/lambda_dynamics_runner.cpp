@@ -57,21 +57,29 @@ int main(int argc, char* argv[]) {
 
   // Simple argument parsing
   if (argc < 3) {
-    std::cout << "Usage: " << argv[0] << " <topology.prmtop> <coords.inpcrd> [n_steps]" << std::endl;
-    std::cout << "Example: " << argv[0] << " benzene.prmtop benzene.inpcrd 10000" << std::endl;
+    std::cout << "Usage: " << argv[0] << " <topology.prmtop> <coords.inpcrd> [n_steps] [lambda]" << std::endl;
+    std::cout << "Example: " << argv[0] << " benzene.prmtop benzene.inpcrd 10000 0.5" << std::endl;
+    std::cout << "         lambda=1.0 (default) for parity testing, 0.0-1.0 for lambda scaling tests" << std::endl;
     return 1;
   }
 
   const std::string prmtop_file = argv[1];
   const std::string inpcrd_file = argv[2];
   const int n_steps = (argc > 3) ? std::atoi(argv[3]) : 10000;
+  const double lambda_value = (argc > 4) ? std::atof(argv[4]) : 1.0;
   const double timestep = 0.001;  // 1 fs in ps units
 
-  std::cout << "Lambda Dynamics Test (Parity Mode - all lambda=1.0)" << std::endl;
+  std::cout << "Lambda Dynamics Test" << std::endl;
   std::cout << "Topology: " << prmtop_file << std::endl;
   std::cout << "Coordinates: " << inpcrd_file << std::endl;
   std::cout << "Steps: " << n_steps << std::endl;
   std::cout << "Timestep: " << timestep << " ps" << std::endl;
+  std::cout << "Lambda: " << lambda_value << std::endl;
+  if (lambda_value == 1.0) {
+    std::cout << "Mode: Parity testing (lambda=1.0, should match standard dynamics)" << std::endl;
+  } else {
+    std::cout << "Mode: Lambda scaling test" << std::endl;
+  }
 
 #ifndef STORMM_USE_CUDA
   std::cout << "ERROR: This test requires CUDA support. Recompile with CUDA enabled." << std::endl;
@@ -95,16 +103,16 @@ int main(int argc, char* argv[]) {
     // Get nonbonded kit for setting up lambda arrays
     const NonbondedKit<double> nbk = topology.getDoublePrecisionNonbondedKit();
 
-    // Initialize lambda arrays - all set to 1.0 for parity mode
+    // Initialize lambda arrays with specified lambda value
     Hybrid<double> lambda_vdw(n_atoms, "lambda_vdw");
     Hybrid<double> lambda_ele(n_atoms, "lambda_ele");
     Hybrid<double> atom_sigma(n_atoms, "atom_sigma");
     Hybrid<double> atom_epsilon(n_atoms, "atom_epsilon");
 
-    // Set all lambda values to 1.0 (fully coupled - parity mode)
+    // Set all lambda values to the specified value
     for (int i = 0; i < n_atoms; i++) {
-      lambda_vdw.putHost(1.0, i);
-      lambda_ele.putHost(1.0, i);
+      lambda_vdw.putHost(lambda_value, i);
+      lambda_ele.putHost(lambda_value, i);
 
       // Get LJ parameters from topology
       const int lj_idx = nbk.lj_idx[i];
@@ -243,36 +251,31 @@ int main(int argc, char* argv[]) {
 
     // Main dynamics loop
     for (int step = 0; step < n_steps; step++) {
-      // Enable energy evaluation every 1000 steps (matching standard STORMM)
-      const bool on_energy_step = (step % 1000 == 0) || (step == n_steps - 1);
+      // Enable energy evaluation on first step, every 1000 steps, and last step
+      const bool on_energy_step = (step == 0) || (step % 1000 == 0) || (step == n_steps - 1);
       const EvaluateEnergy eval_energy = on_energy_step ?
           EvaluateEnergy::YES : EvaluateEnergy::NO;
 
-      // Launch GPU lambda dynamics step
-      launchGpuLambdaDynamicsStep(
-          n_atoms, n_atoms, d_coupled_indices,  // All atoms coupled in parity mode
-          d_lambda_vdw, d_lambda_ele,
-          d_atom_sigma, d_atom_epsilon,
-          d_exclusion_mask, d_supertile_map, d_tile_map, supertile_stride,
-          nbk.coulomb_constant,
-          ewald_coeff,
-          d_per_atom_elec, d_per_atom_vdw,
-          d_xcrd, d_ycrd, d_zcrd,
-          d_xfrc, d_yfrc, d_zfrc,
-          d_umat, unit_cell,
-          nbk.charge,
-          &ag_synthesis,
-          ps_synthesis,  // Already a pointer, don't take address
-          &poly_se,
-          &mmctrl,
-          thermostat_ptr,
-          on_energy_step ? &scorecard : nullptr,  // Only pass scorecard on energy steps
-          &launcher,
-          &valence_cache,
-          &nonb_cache,
-          eval_energy,
-          nullptr,  // No GB workspace
-          ImplicitSolventModel::NONE);
+      // Launch lambda dynamics step using new clean API
+      // NOTE: Changed from deprecated launchGpuLambdaDynamicsStep to launchLambdaDynamicsStep
+      // The new API takes high-level STORMM objects and handles all GPU pointer extraction internally
+      launchLambdaDynamicsStep(
+          d_lambda_vdw,           // Per-atom VDW lambda (all 1.0 for parity)
+          d_lambda_ele,           // Per-atom electrostatic lambda (all 1.0 for parity)
+          d_coupled_indices,      // Indices of coupled atoms
+          n_atoms,                // Number of coupled atoms (all atoms in parity mode)
+          ag_synthesis,           // Topology synthesis (const reference)
+          poly_se,                // Static exclusion mask synthesis (const reference)
+          thermostat_ptr,         // Thermostat (nullptr for NVE)
+          ps_synthesis,           // Phase space synthesis pointer (coordinates, velocities, forces)
+          &mmctrl,                // MM controls (timestep, counters, integration mode)
+          &scorecard,             // ScoreCard - always pass (eval_energy flag controls computation)
+          launcher,               // Kernel launch manager (const reference)
+          &valence_cache,         // Valence cache resource
+          &nonb_cache,            // Nonbonded cache resource
+          eval_energy,            // Energy evaluation flag (controls whether energies computed)
+          nullptr,                // GB workspace (nullptr = GB disabled)
+          ImplicitSolventModel::NONE); // GB model (NONE for now)
 
       // Increment step counter
       mmctrl.incrementStep();
@@ -292,6 +295,9 @@ int main(int argc, char* argv[]) {
     // Calculate timing
     double total_time_ms = duration_ms.count();
     double time_per_step_ms = total_time_ms / n_steps;
+
+    // Download energies from GPU to host
+    scorecard.download();
 
     // Get final energy if available
     double total_energy = 0.0;

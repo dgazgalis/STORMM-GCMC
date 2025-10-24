@@ -1973,25 +1973,16 @@ void NCMCSampler::propagateSystem(int n_steps) {
       const energy::EvaluateEnergy eval_energy = on_energy_step ?
           energy::EvaluateEnergy::YES : energy::EvaluateEnergy::NO;
 
-      mm::launchGpuLambdaDynamicsStep(
-          n_atoms, n_coupled, d_coupled_indices,
+      mm::launchLambdaDynamicsStep(
           d_lambda_vdw, d_lambda_ele,
-          d_atom_sigma, d_atom_epsilon,
-          d_exclusion_mask, d_supertile_map, d_tile_map, supertile_stride,
-          nbk.coulomb_constant,
-          ewald_coeff_,  // Ewald coefficient for direct space erfc(α·r)/r splitting
-          d_per_atom_elec, d_per_atom_vdw,
-          d_xcrd, d_ycrd, d_zcrd,  // Raw device pointers for nonbonded kernel
-          d_xfrc, d_yfrc, d_zfrc,  // Raw device pointers for nonbonded kernel
-          d_umat, unit_cell,       // Unit cell info for nonbonded kernel
-          nbk.charge,              // Charges for nonbonded kernel
-          topology_synthesis_,     // Topology synthesis (constraints, virtual sites, valence)
-          ps_synthesis_,           // Phase space synthesis (coordinates, velocities, forces)
-          &poly_se,                // Static exclusion mask synthesis (for nonbonded interactions)
-          &mmctrl,                 // MM controls (now required for MOVE_PARTICLES mode)
+          d_coupled_indices, n_coupled,
+          *topology_synthesis_,    // Topology synthesis (const reference)
+          poly_se,                 // Static exclusion mask synthesis (const reference)
           thermostat_,             // Thermostat (integrated automatically in MOVE_PARTICLES)
+          ps_synthesis_,           // Phase space synthesis (coordinates, velocities, forces)
+          &mmctrl,                 // MM controls (now required for MOVE_PARTICLES mode)
           &scorecard_,             // Score card for energy tracking
-          &launcher,               // Kernel launcher for GPU parameters
+          launcher,                // Kernel launcher (const reference)
           &valence_cache,          // Cache resource for valence kernel thread blocks
           &nonb_cache,             // Cache resource for nonbonded kernel thread blocks
           eval_energy,             // Energy evaluation control
@@ -3343,25 +3334,16 @@ void NCMCSystemSampler::propagateSystem(int n_steps) {
       const energy::EvaluateEnergy eval_energy = on_energy_step ?
           energy::EvaluateEnergy::YES : energy::EvaluateEnergy::NO;
 
-      mm::launchGpuLambdaDynamicsStep(
-          n_atoms, n_coupled, d_coupled_indices,
+      mm::launchLambdaDynamicsStep(
           d_lambda_vdw, d_lambda_ele,
-          d_atom_sigma, d_atom_epsilon,
-          d_exclusion_mask, d_supertile_map, d_tile_map, supertile_stride,
-          nbk.coulomb_constant,
-          ewald_coeff_,  // Ewald coefficient for direct space erfc(α·r)/r splitting
-          d_per_atom_elec, d_per_atom_vdw,
-          d_xcrd, d_ycrd, d_zcrd,  // Raw device pointers for nonbonded kernel
-          d_xfrc, d_yfrc, d_zfrc,  // Raw device pointers for nonbonded kernel
-          d_umat, unit_cell,       // Unit cell info for nonbonded kernel
-          nbk.charge,              // Charges for nonbonded kernel
-          topology_synthesis_,     // Topology synthesis (constraints, virtual sites, valence)
-          ps_synthesis_,           // Phase space synthesis (coordinates, velocities, forces)
-          &poly_se,                // Static exclusion mask synthesis (for nonbonded interactions)
-          &mmctrl,                 // MM controls (now required for MOVE_PARTICLES mode)
+          d_coupled_indices, n_coupled,
+          *topology_synthesis_,    // Topology synthesis (const reference)
+          poly_se,                 // Static exclusion mask synthesis (const reference)
           thermostat_,             // Thermostat (integrated automatically in MOVE_PARTICLES)
+          ps_synthesis_,           // Phase space synthesis (coordinates, velocities, forces)
+          &mmctrl,                 // MM controls (now required for MOVE_PARTICLES mode)
           &scorecard_,             // Score card for energy tracking
-          &launcher,               // Kernel launcher for GPU parameters
+          launcher,                // Kernel launcher (const reference)
           &valence_cache,          // Cache resource for valence kernel thread blocks
           &nonb_cache,             // Cache resource for nonbonded kernel thread blocks
           eval_energy,             // Energy evaluation control

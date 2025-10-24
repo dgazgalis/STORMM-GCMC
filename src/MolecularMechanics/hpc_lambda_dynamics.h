@@ -92,6 +92,9 @@ void launchZeroForces(
     double* fy,
     double* fz);
 
+/*
+/// DEPRECATED: Old double* interface - kept as reference, use launchLambdaDynamicsStep instead
+///
 /// \brief Complete GPU velocity Verlet MD step with lambda-scaled forces and full integration
 ///
 /// Performs a complete MD cycle using STORMM's MOVE_PARTICLES integration mode,  which
@@ -190,7 +193,48 @@ void launchGpuLambdaDynamicsStep(
     energy::EvaluateEnergy eval_energy,
     synthesis::ImplicitSolventWorkspace* gb_workspace = nullptr,
     topology::ImplicitSolventModel gb_model = topology::ImplicitSolventModel::NONE);
+*/
 
+
+/// \brief High-level lambda dynamics wrapper matching launchDynamics interface
+///
+/// This provides a clean interface for lambda dynamics that matches the standard
+/// dynamics launcher. For parity testing (all lambda=1.0), results should be
+/// identical to launchDynamics.
+///
+/// \param lambda_vdw        Per-atom VDW lambda values (device array, n_atoms)
+/// \param lambda_ele        Per-atom electrostatic lambda values (device array, n_atoms)
+/// \param coupled_indices   Indices of coupled atoms (device array)
+/// \param n_coupled         Number of coupled atoms
+/// \param poly_ag           Topology synthesis
+/// \param poly_se           Static exclusion mask synthesis
+/// \param tst               Thermostat (nullptr for NVE)
+/// \param poly_ps           Phase space synthesis (coordinates, velocities, forces)
+/// \param mmctrl            Molecular mechanics controls
+/// \param sc                Score card for energy tracking
+/// \param launcher          Kernel launch manager
+/// \param valence_cache     Cache resource for valence calculations
+/// \param nonb_cache        Cache resource for nonbonded calculations
+/// \param eval_energy       Whether to evaluate energies this step
+/// \param gb_workspace      Implicit solvent workspace (nullptr = disabled)
+/// \param gb_model          Implicit solvent model
+void launchLambdaDynamicsStep(
+    const double* lambda_vdw,
+    const double* lambda_ele,
+    const int* coupled_indices,
+    int n_coupled,
+    const synthesis::AtomGraphSynthesis& poly_ag,
+    const synthesis::StaticExclusionMaskSynthesis& poly_se,
+    trajectory::Thermostat* tst,
+    synthesis::PhaseSpaceSynthesis* poly_ps,
+    MolecularMechanicsControls* mmctrl,
+    energy::ScoreCard* sc,
+    const card::CoreKlManager& launcher,
+    energy::CacheResource* valence_cache,
+    energy::CacheResource* nonb_cache,
+    energy::EvaluateEnergy eval_energy,
+    synthesis::ImplicitSolventWorkspace* gb_workspace = nullptr,
+    topology::ImplicitSolventModel gb_model = topology::ImplicitSolventModel::NONE);
 
 } // namespace mm
 } // namespace stormm
