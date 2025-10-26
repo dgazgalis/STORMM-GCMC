@@ -1,8 +1,31 @@
 // -*-c++-*-
 #include "copyright.h"
+#include <iostream>
+#ifdef STORMM_USE_HPC
+#include <cuda_runtime.h>
+#include <mutex>
+#include <unordered_set>
+#endif
 
 namespace stormm {
 namespace card {
+
+#ifdef STORMM_USE_HPC
+namespace {
+
+// Track work_unit_prog_data device allocations to detect double frees.
+inline std::unordered_set<const void*>& workUnitDeviceRegistry() {
+  static std::unordered_set<const void*> registry;
+  return registry;
+}
+
+inline std::mutex& workUnitDeviceRegistryMutex() {
+  static std::mutex registry_mutex;
+  return registry_mutex;
+}
+
+} // namespace
+#endif
 
 //-------------------------------------------------------------------------------------------------
 template <typename T> Hybrid<T>::Hybrid(const size_t length_in, const char* tag_in,
@@ -1361,7 +1384,35 @@ template <typename T> void Hybrid<T>::allocate() {
     break;
 #endif
   }
-  
+
+#ifdef STORMM_USE_HPC
+#if STORMM_HYBRID_DEBUG
+  const std::string label_name(label.name);
+  if (label_name == "work_unit_prog_data" && devc_data != nullptr) {
+    std::lock_guard<std::mutex> guard(workUnitDeviceRegistryMutex());
+    auto& registry = workUnitDeviceRegistry();
+    const bool inserted = registry.insert(devc_data).second;
+    if (!inserted) {
+      std::cerr << "DEBUG: Hybrid register duplicate work_unit_prog_data device pointer="
+                << static_cast<const void*>(devc_data) << std::endl;
+    }
+    else {
+      std::cerr << "DEBUG: Hybrid register work_unit_prog_data device pointer="
+                << static_cast<const void*>(devc_data) << std::endl;
+    }
+  }
+  if (label_name == "work_unit_prog_data") {
+    std::cerr << "DEBUG: Hybrid allocate label=" << label.name
+              << " host=" << static_cast<const void*>(host_data)
+              << " dev=" << static_cast<const void*>(devc_data)
+              << " format=" << static_cast<int>(format)
+              << " length=" << length << " capacity=" << max_capacity << std::endl;
+  }
+#else
+  (void)label;
+#endif
+#endif
+
   // Increment this object's allocations and record the result in the ledger
   allocations += 1;
   gbl_mem_balance_sheet.logMemory(max_capacity, element_size, format, label, allocating);
@@ -1372,6 +1423,13 @@ template <typename T> void Hybrid<T>::deallocate() {
 
   // Make sure that this is not a pointer
   assert (kind == HybridKind::ARRAY);
+
+#ifdef STORMM_USE_HPC
+#if STORMM_HYBRID_DEBUG
+  std::cerr << "DEBUG: Hybrid deallocate label=" << label.name
+            << " format=" << static_cast<int>(format) << std::endl;
+#endif
+#endif
 
   // Memory should currently be allocated
   switch (format) {
@@ -1398,51 +1456,217 @@ template <typename T> void Hybrid<T>::deallocate() {
 #endif
   }
   
+#ifdef STORMM_USE_HPC
+#if STORMM_HYBRID_DEBUG
+  const std::string label_name(label.name);
+  auto log_dealloc = [&](const char* stage) {
+    if (label_name == "work_unit_prog_data") {
+      std::cerr << "DEBUG: Hybrid(" << label.name << ") " << stage
+                << " host=" << static_cast<const void*>(host_data)
+                << " dev=" << static_cast<const void*>(devc_data) << std::endl;
+    }
+  };
+  auto sync_and_inspect = [&](const void* ptr, const char* action) {
+    if (label_name == "work_unit_prog_data" && ptr != nullptr) {
+      cudaPointerAttributes attrs;
+      const cudaError_t attr_status = cudaPointerGetAttributes(&attrs, ptr);
+      if (attr_status != cudaSuccess) {
+        std::cerr << "DEBUG: Hybrid(" << label.name << ") cudaPointerGetAttributes before "
+                  << action << " failed for ptr=" << ptr << " : "
+                  << cudaGetErrorString(attr_status) << " ("
+                  << static_cast<int>(attr_status) << ")" << std::endl;
+      }
+      else {
+        std::cerr << "DEBUG: Hybrid(" << label.name << ") cudaPointerGetAttributes before "
+                  << action << " ptr=" << ptr << " type=" << attrs.type
+                  << " device=" << attrs.device << std::endl;
+      }
+      const cudaError_t sync_status = cudaDeviceSynchronize();
+      if (sync_status != cudaSuccess) {
+        std::cerr << "DEBUG: Hybrid(" << label.name << ") cudaDeviceSynchronize before "
+                  << action << " failed: " << cudaGetErrorString(sync_status) << " ("
+                  << static_cast<int>(sync_status) << ")" << std::endl;
+      }
+    }
+  };
+  auto report_cuda_status = [&](const char* api, const cudaError_t status, const void* ptr) {
+    if (label_name == "work_unit_prog_data") {
+      if (status != cudaSuccess) {
+        std::cerr << "DEBUG: Hybrid(" << label.name << ") " << api << " failed for ptr="
+                  << ptr << " : " << cudaGetErrorString(status) << " ("
+                  << static_cast<int>(status) << ")" << std::endl;
+      }
+      else {
+        std::cerr << "DEBUG: Hybrid(" << label.name << ") " << api << " succeeded for ptr="
+                  << ptr << std::endl;
+      }
+    }
+  };
+  auto unregister_device_ptr = [&](const void* ptr) {
+    if (label_name == "work_unit_prog_data" && ptr != nullptr) {
+      std::lock_guard<std::mutex> guard(workUnitDeviceRegistryMutex());
+      auto& registry = workUnitDeviceRegistry();
+      if (registry.erase(ptr) == 0) {
+        std::cerr << "DEBUG: Hybrid(" << label.name << ") device pointer "
+                  << ptr << " not found in registry during unregister" << std::endl;
+      }
+      else {
+        std::cerr << "DEBUG: Hybrid(" << label.name << ") unregistered device pointer "
+                  << ptr << std::endl;
+      }
+    }
+  };
+#else
+  [[maybe_unused]] const std::string label_name(label.name);
+  auto log_dealloc = [](const char*) {};
+  auto sync_and_inspect = [](const void*, const char*) {};
+  auto report_cuda_status = [](const char*, const cudaError_t, const void*) {};
+  auto unregister_device_ptr = [](const void*) {};
+#endif
+#endif
+
+  // Skip if already freed
+#ifdef STORMM_USE_HPC
+  bool already_freed = false;
+  switch (format) {
+  case HybridFormat::EXPEDITED:
+  case HybridFormat::DECOUPLED:
+    already_freed = (host_data == nullptr && devc_data == nullptr);
+    break;
+  case HybridFormat::UNIFIED:
+  case HybridFormat::DEVICE_ONLY:
+    already_freed = (devc_data == nullptr);
+    break;
+  case HybridFormat::HOST_ONLY:
+  case HybridFormat::HOST_MOUNTED:
+    already_freed = (host_data == nullptr);
+    break;
+  default:
+    break;
+  }
+  if (already_freed) {
+#if STORMM_HYBRID_DEBUG
+    if (label_name == "work_unit_prog_data") {
+      std::cerr << "DEBUG: Hybrid(" << label.name
+                << ") already freed; skipping" << std::endl;
+    }
+#endif
+    return;
+  }
+#else
+  if (format == HybridFormat::HOST_ONLY && host_data == nullptr) {
+    return;
+  }
+#endif
+
   // If no memory is currently allocated, do nothing
   switch (format) {
 #ifdef STORMM_USE_HPC
   case HybridFormat::EXPEDITED:
-    if (cudaFreeHost(host_data) != cudaSuccess) {
-      rtErr("cudaFreeHost failed in object " + std::string(label.name) + ".", "Hybrid",
-            "deallocate");
+    log_dealloc("cudaFreeHost");
+    {
+      const void* host_ptr_snapshot = host_data;
+      const cudaError_t host_status = cudaFreeHost(host_data);
+      report_cuda_status("cudaFreeHost", host_status, host_ptr_snapshot);
+      if (host_status != cudaSuccess) {
+        rtErr("cudaFreeHost failed in object " + std::string(label.name) + ".", "Hybrid",
+              "deallocate");
+      }
     }
-    if (cudaFree(devc_data) != cudaSuccess) {
-      rtErr("cudaFree failed in object " + std::string(label.name) + ".", "Hybrid",
-            "deallocate");
-    }
-    break;
-  case HybridFormat::DECOUPLED:
-    delete[] host_data;
-    if (cudaFree(devc_data) != cudaSuccess) {
-      rtErr("cudaFree failed in object " + std::string(label.name) + ".", "Hybrid",
-            "deallocate");
-    }
-    break;
-  case HybridFormat::UNIFIED:
-    if (cudaFree(host_data) != cudaSuccess) {
-      rtErr("cudaFree failed in object " + std::string(label.name) + ".", "Hybrid",
-            "deallocate");
+    host_data = nullptr;
+    log_dealloc("cudaFree");
+    {
+      const void* dev_ptr_snapshot = devc_data;
+      sync_and_inspect(dev_ptr_snapshot, "cudaFree");
+      const cudaError_t dev_status = cudaFree(devc_data);
+      report_cuda_status("cudaFree", dev_status, dev_ptr_snapshot);
+      if (dev_status == cudaSuccess) {
+        unregister_device_ptr(dev_ptr_snapshot);
+      }
+      if (dev_status != cudaSuccess) {
+        rtErr("cudaFree failed in object " + std::string(label.name) + ".", "Hybrid",
+              "deallocate");
+      }
     }
     devc_data = nullptr;
     break;
-  case HybridFormat::HOST_ONLY:
+  case HybridFormat::DECOUPLED:
+    log_dealloc("delete_host");
     delete[] host_data;
+    host_data = nullptr;
+    log_dealloc("cudaFree");
+    {
+      const void* dev_ptr_snapshot = devc_data;
+      sync_and_inspect(dev_ptr_snapshot, "cudaFree");
+      const cudaError_t dev_status = cudaFree(devc_data);
+      report_cuda_status("cudaFree", dev_status, dev_ptr_snapshot);
+      if (dev_status == cudaSuccess) {
+        unregister_device_ptr(dev_ptr_snapshot);
+      }
+      if (dev_status != cudaSuccess) {
+        rtErr("cudaFree failed in object " + std::string(label.name) + ".", "Hybrid",
+              "deallocate");
+      }
+    }
+    devc_data = nullptr;
+    break;
+  case HybridFormat::UNIFIED:
+    log_dealloc("cudaFree");
+    {
+      const void* dev_ptr_snapshot = devc_data;
+      sync_and_inspect(dev_ptr_snapshot, "cudaFree");
+      const cudaError_t dev_status = cudaFree(host_data);
+      report_cuda_status("cudaFree", dev_status, dev_ptr_snapshot);
+      if (dev_status == cudaSuccess) {
+        unregister_device_ptr(dev_ptr_snapshot);
+      }
+      if (dev_status != cudaSuccess) {
+        rtErr("cudaFree failed in object " + std::string(label.name) + ".", "Hybrid",
+              "deallocate");
+      }
+    }
+    devc_data = nullptr;
+    host_data = nullptr;
+    break;
+  case HybridFormat::HOST_ONLY:
+    log_dealloc("delete_host");
+    delete[] host_data;
+    host_data = nullptr;
     break;
   case HybridFormat::DEVICE_ONLY:
-    if (cudaFree(devc_data) != cudaSuccess) {
-      rtErr("cudaFree failed in object " + std::string(label.name) + ".", "Hybrid",
-            "deallocate");
+    log_dealloc("cudaFree");
+    {
+      const void* dev_ptr_snapshot = devc_data;
+      sync_and_inspect(dev_ptr_snapshot, "cudaFree");
+      const cudaError_t dev_status = cudaFree(devc_data);
+      report_cuda_status("cudaFree", dev_status, dev_ptr_snapshot);
+      if (dev_status == cudaSuccess) {
+        unregister_device_ptr(dev_ptr_snapshot);
+      }
+      if (dev_status != cudaSuccess) {
+        rtErr("cudaFree failed in object " + std::string(label.name) + ".", "Hybrid",
+              "deallocate");
+      }
     }
+    devc_data = nullptr;
     break;
   case HybridFormat::HOST_MOUNTED:
-    if (cudaFreeHost(host_data) != cudaSuccess) {
-      rtErr("cudaFreeHost failed in object " + std::string(label.name) + ".", "Hybrid",
-            "deallocate");
+    log_dealloc("cudaFreeHost");
+    {
+      const void* host_ptr_snapshot = host_data;
+      const cudaError_t host_status = cudaFreeHost(host_data);
+      report_cuda_status("cudaFreeHost", host_status, host_ptr_snapshot);
+      if (host_status != cudaSuccess) {
+        rtErr("cudaFreeHost failed in object " + std::string(label.name) + ".", "Hybrid",
+              "deallocate");
+      }
     }
+    host_data = nullptr;
     break;
 #else
   case HybridFormat::HOST_ONLY:
     delete[] host_data;
+    host_data = nullptr;
     break;
 #endif
   }
@@ -1652,3 +1876,6 @@ Hybrid<T> setPointer(Hybrid<T> *target, const size_t offset, const size_t length
 
 } // namespace card
 } // namespace stormm
+#ifndef STORMM_HYBRID_DEBUG
+#define STORMM_HYBRID_DEBUG 0
+#endif

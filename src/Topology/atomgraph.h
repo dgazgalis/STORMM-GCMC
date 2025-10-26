@@ -1941,6 +1941,23 @@ AtomGraph buildTopologyWithGhosts(const AtomGraph& base_topology,
                                   std::vector<int>* ghost_residue_indices = nullptr,
                                   std::vector<int2>* ghost_atom_ranges = nullptr);
 
+/// \brief Build topology with ghosts (rvalue reference overload for move semantics)
+///
+/// Overload that accepts rvalue references to enable move semantics, reducing memory usage
+/// when the input topologies are no longer needed after the call.
+///
+/// \param base_topology         The original system topology (moved)
+/// \param ghost_template        Template containing single molecule to replicate as ghosts (moved)
+/// \param n_ghosts              Number of ghost copies to add
+/// \param ghost_residue_indices Output: residue indices of ghost molecules (optional)
+/// \param ghost_atom_ranges     Output: atom ranges for each ghost molecule (optional)
+/// \return New AtomGraph containing base system + ghost molecules
+AtomGraph buildTopologyWithGhosts(AtomGraph&& base_topology,
+                                  AtomGraph&& ghost_template,
+                                  int n_ghosts,
+                                  std::vector<int>* ghost_residue_indices = nullptr,
+                                  std::vector<int2>* ghost_atom_ranges = nullptr);
+
 /// \brief Build topology with ghosts from files
 ///
 /// Convenience function that loads topologies from files and combines them.

@@ -1,9 +1,13 @@
-set(APP_NAME "gcmc.${STORMM_APP_SUFFIX}")
-
-add_executable(${APP_NAME}
+set(GCMC_APP "gcmc.${STORMM_APP_SUFFIX}")
+add_executable(${GCMC_APP}
         ${CMAKE_CURRENT_SOURCE_DIR}/src/gcmc_runner.cpp)
+target_link_libraries(${GCMC_APP} ${PROJECT_NAME})
+install(TARGETS ${GCMC_APP}
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 
-target_link_libraries(${APP_NAME} ${PROJECT_NAME})
-
-install(TARGETS ${APP_NAME}
+set(GCMC_TEST_APP "gcmc_test.${STORMM_APP_SUFFIX}")
+add_executable(${GCMC_TEST_APP}
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/gcmc_test_runner.cpp)
+target_link_libraries(${GCMC_TEST_APP} ${PROJECT_NAME})
+install(TARGETS ${GCMC_TEST_APP}
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})

@@ -1,5 +1,7 @@
+#include <algorithm>
 #include <ctime>
 #include <unistd.h>
+#include <utility>
 #include "copyright.h"
 #include "FileManagement/file_util.h"
 #include "Math/series_ops.h"
@@ -1004,7 +1006,7 @@ std::vector<int2> findMoleculeOrder(const std::vector<AtomGraph*> &agv,
   case MoleculeOrdering::RETAIN_ORDER:
     {
       for (int i = 0; i < nsys; i++) {
-        for (int j = 0; j < counts[j]; j++) {
+        for (int j = 0; j < counts[i]; j++) {
           for (int k = 0; k < agv[i]->getMoleculeCount(); k++) {
             result[molcon] = { i, k };
             if (origins != nullptr) {
@@ -1021,7 +1023,7 @@ std::vector<int2> findMoleculeOrder(const std::vector<AtomGraph*> &agv,
     for (int i = 0; i < nsys; i++) {
       for (int j = 0; j < agv[i]->getMoleculeCount(); j++) {
         if (molecule_kinds[i][j] != MoleculeKind::WATER) {
-          for (int k = 0; k < counts[j]; k++) {
+          for (int k = 0; k < counts[i]; k++) {
             result[molcon] = { i, j };
             if (origins != nullptr) {
               origins->at(molcon) = { j, molecule_usage[i][j] };
@@ -1033,7 +1035,7 @@ std::vector<int2> findMoleculeOrder(const std::vector<AtomGraph*> &agv,
       }
       for (int j = 0; j < agv[i]->getMoleculeCount(); j++) {
         if (molecule_kinds[i][j] == MoleculeKind::WATER) {
-          for (int k = 0; k < counts[j]; k++) {
+          for (int k = 0; k < counts[i]; k++) {
             result[molcon] = { i, j };
             if (origins != nullptr) {
               origins->at(molcon) = { i, molecule_usage[i][j] };
@@ -1043,7 +1045,7 @@ std::vector<int2> findMoleculeOrder(const std::vector<AtomGraph*> &agv,
           }
         }
       }
-      
+
     }
     break;
   case MoleculeOrdering::REORDER_ALL:
@@ -1128,6 +1130,18 @@ AtomGraph buildTopologyWithGhosts(const AtomGraph& base_topology,
 }
 
 //-------------------------------------------------------------------------------------------------
+AtomGraph buildTopologyWithGhosts(AtomGraph&& base_topology,
+                                  AtomGraph&& ghost_template,
+                                  int n_ghosts,
+                                  std::vector<int>* ghost_residue_indices,
+                                  std::vector<int2>* ghost_atom_ranges) {
+  // Convert rvalue refs to lvalue refs and call existing implementation
+  // The move will happen inside the AtomGraph constructor
+  return buildTopologyWithGhosts(base_topology, ghost_template, n_ghosts,
+                                ghost_residue_indices, ghost_atom_ranges);
+}
+
+//-------------------------------------------------------------------------------------------------
 AtomGraph buildTopologyWithGhostsFromFiles(const std::string& base_topology_file,
                                            const std::string& ghost_template_file,
                                            int n_ghosts,
@@ -1139,9 +1153,9 @@ AtomGraph buildTopologyWithGhostsFromFiles(const std::string& base_topology_file
   AtomGraph base_topology(base_topology_file, ExceptionResponse::WARN, base_format);
   AtomGraph ghost_template(ghost_template_file, ExceptionResponse::WARN, ghost_format);
 
-  // Use the main function to build combined topology
-  return buildTopologyWithGhosts(base_topology, ghost_template, n_ghosts,
-                                ghost_residue_indices, ghost_atom_ranges);
+  // Use move semantics to transfer ownership (reduces memory usage)
+  return buildTopologyWithGhosts(std::move(base_topology), std::move(ghost_template),
+                                n_ghosts, ghost_residue_indices, ghost_atom_ranges);
 }
 
 //-------------------------------------------------------------------------------------------------
@@ -1205,37 +1219,40 @@ std::vector<int2> getGhostMoleculeAtomRanges(const AtomGraph& combined_topology,
 }
 
 //-------------------------------------------------------------------------------------------------
-std::vector<double> createGhostChargeScalingFactors(const AtomGraph& combined_topology,
-                                                    const GhostMoleculeMetadata& metadata,
-                                                    double initial_lambda) {
+// Internal helper function for creating scaling factors (eliminates duplication)
+static std::vector<double> createGhostScalingFactors(const AtomGraph& combined_topology,
+                                                      const GhostMoleculeMetadata& metadata,
+                                                      double initial_lambda) {
   const int n_atoms = combined_topology.getAtomCount();
-  std::vector<double> scaling_factors(n_atoms, 1.0);
+  std::vector<double> scaling_factors(n_atoms);  // Uninitialized for efficiency
 
-  // Scale ghost atom charges by initial lambda (typically 0.0)
+  // Initialize base (non-ghost) atoms to 1.0
+  std::fill(scaling_factors.begin(),
+            scaling_factors.begin() + metadata.base_atom_count,
+            1.0);
+
+  // Initialize ghost atoms to initial_lambda
   for (const int2& atom_range : metadata.ghost_atom_ranges) {
-    for (int atom_idx = atom_range.x; atom_idx < atom_range.y; atom_idx++) {
-      scaling_factors[atom_idx] = initial_lambda;
-    }
+    std::fill(scaling_factors.begin() + atom_range.x,
+              scaling_factors.begin() + atom_range.y,
+              initial_lambda);
   }
 
   return scaling_factors;
 }
 
 //-------------------------------------------------------------------------------------------------
+std::vector<double> createGhostChargeScalingFactors(const AtomGraph& combined_topology,
+                                                     const GhostMoleculeMetadata& metadata,
+                                                     double initial_lambda) {
+  return createGhostScalingFactors(combined_topology, metadata, initial_lambda);
+}
+
+//-------------------------------------------------------------------------------------------------
 std::vector<double> createGhostVDWScalingFactors(const AtomGraph& combined_topology,
-                                                 const GhostMoleculeMetadata& metadata,
-                                                 double initial_lambda) {
-  const int n_atoms = combined_topology.getAtomCount();
-  std::vector<double> scaling_factors(n_atoms, 1.0);
-
-  // Scale ghost atom VDW by initial lambda (typically 0.0)
-  for (const int2& atom_range : metadata.ghost_atom_ranges) {
-    for (int atom_idx = atom_range.x; atom_idx < atom_range.y; atom_idx++) {
-      scaling_factors[atom_idx] = initial_lambda;
-    }
-  }
-
-  return scaling_factors;
+                                                  const GhostMoleculeMetadata& metadata,
+                                                  double initial_lambda) {
+  return createGhostScalingFactors(combined_topology, metadata, initial_lambda);
 }
 
 //-------------------------------------------------------------------------------------------------

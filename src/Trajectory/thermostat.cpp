@@ -1137,6 +1137,8 @@ void Thermostat::upload() {
   sp_final_temperatures.upload();
   random_state_vector_xy.upload();
   random_state_vector_zw.upload();
+  random_cache.upload();
+  sp_random_cache.upload();
 }
 
 //-------------------------------------------------------------------------------------------------

@@ -1012,16 +1012,31 @@ void launchLambdaNonbonded(
   const double2* ljab_coeff_ptr = nbk.ljab_coeff + lj_offset;
 
   // Per-atom energy arrays for GPU-side reduction
-  Hybrid<double> per_atom_elec(n_coupled, "per_atom_elec");
-  Hybrid<double> per_atom_vdw(n_coupled, "per_atom_vdw");
-  per_atom_elec.upload();
-  per_atom_vdw.upload();
+  // CRITICAL: Use static variables to avoid memory leak from repeated allocations
+  // These are allocated once and reused across all GCMC cycles, preventing
+  // cudaFreeHost failures from pinned memory fragmentation
+  static Hybrid<double> per_atom_elec(1, "per_atom_elec");
+  static Hybrid<double> per_atom_vdw(1, "per_atom_vdw");
+
+  // Resize if needed (only allocates if size changed)
+  if (per_atom_elec.size() != n_coupled) {
+    per_atom_elec.resize(n_coupled);
+    per_atom_vdw.resize(n_coupled);
+    per_atom_elec.upload();
+    per_atom_vdw.upload();
+  }
 
   // Device scalars for GPU-reduced total energies
-  Hybrid<double> total_elec_dev(1, "total_elec_reduced");
-  Hybrid<double> total_vdw_dev(1, "total_vdw_reduced");
-  total_elec_dev.upload();
-  total_vdw_dev.upload();
+  // CRITICAL: Use static variables to avoid memory leak from repeated allocations
+  static Hybrid<double> total_elec_dev(1, "total_elec_reduced");
+  static Hybrid<double> total_vdw_dev(1, "total_vdw_reduced");
+  static bool scalars_initialized = false;
+
+  if (!scalars_initialized) {
+    total_elec_dev.upload();
+    total_vdw_dev.upload();
+    scalars_initialized = true;
+  }
 
   // Get implicit solvent model
   const ImplicitSolventModel gb_model = poly_ag.getImplicitSolventModel();

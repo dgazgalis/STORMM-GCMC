@@ -28,6 +28,10 @@
 #include "gcmc_sphere.h"
 #include "mc_mover.h"
 #include "ncmc_protocol.h"
+#include "MolecularMechanics/mm_controls.h"
+#include "Accelerator/core_kernel_manager.h"
+#include "Potential/cacheresource.h"
+#include "Synthesis/static_mask_synthesis.h"
 
 namespace stormm {
 namespace sampling {
@@ -41,6 +45,8 @@ enum class AnnealingStage {
 };
 
 using card::Hybrid;
+using card::CoreKlManager;
+using energy::CacheResource;
 using energy::CellGrid;
 using energy::EvaluateForce;
 using energy::NonbondedTheme;
@@ -48,7 +54,9 @@ using energy::PMIGrid;
 using energy::ScoreCard;
 using energy::StaticExclusionMask;
 using energy::StaticExclusionMaskReader;
+using mm::MolecularMechanicsControls;
 using namelist::DynamicsControls;
+using synthesis::StaticExclusionMaskSynthesis;
 using random::Xoshiro256ppGenerator;
 using symbols::boltzmann_constant_gafs;
 using symbols::avogadro_number;
@@ -363,6 +371,22 @@ protected:
   CellGrid<double, double, double, double4>* cell_grid_;  ///< Spatial decomposition (owned)
   PMIGrid* pme_grid_;                                   ///< PME grid (owned)
   double ewald_coeff_;                                  ///< Ewald coefficient for PME direct space (0.0 for non-periodic)
+
+  /// \brief Infrastructure for GPU-accelerated lambda dynamics
+  ///
+  /// These objects enable the new launchLambdaDynamicsStep() API:
+  /// - se_synthesis_: Exclusion mask synthesis wrapping exclusions_
+  /// - launcher_: GPU kernel launch manager
+  /// - valence_cache_: Cache resource for valence kernels
+  /// - nonb_cache_: Cache resource for nonbonded kernels
+  /// - mmctrl_: Molecular mechanics controls (timestep, integration mode)
+  ///
+  /// All created in constructor if CUDA is available, nullptr otherwise
+  StaticExclusionMaskSynthesis* se_synthesis_;  ///< Exclusion mask synthesis (owned)
+  CoreKlManager* launcher_;                     ///< GPU kernel launcher (owned)
+  CacheResource* valence_cache_;                ///< Valence kernel cache (owned)
+  CacheResource* nonb_cache_;                   ///< Nonbonded kernel cache (owned)
+  MolecularMechanicsControls* mmctrl_;          ///< MD integration controls (owned)
 
   /// \brief Energy cache to avoid redundant evaluations
   ///

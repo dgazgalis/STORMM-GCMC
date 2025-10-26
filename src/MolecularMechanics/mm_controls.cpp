@@ -1,14 +1,25 @@
 #include "copyright.h"
 #include "Constants/hpc_bounds.h"
+#include <array>
+#include <iostream>
+#ifdef STORMM_USE_HPC
+#include <cuda_runtime.h>
+#endif
 #include "Numerics/split_fixed_precision.h"
 #include "Synthesis/synthesis_enumerators.h"
 #include "Trajectory/trajectory_enumerators.h"
 #include "mm_controls.h"
 
+#ifndef STORMM_MMCTRL_DEBUG
+#define STORMM_MMCTRL_DEBUG 0
+#endif
+
 namespace stormm {
 namespace mm {
 
+using card::HybridFormat;
 using card::HybridKind;
+using card::HybridTargetLevel;
 using stmath::ReductionGoal;
 using namelist::maximum_nt_warp_multiplicity;
 using numerics::AccumulationMethod;
@@ -25,20 +36,27 @@ MolecularMechanicsControls::MolecularMechanicsControls(const double initial_step
     step_number{0}, sd_cycles{sd_cycles_in}, max_cycles{max_cycles_in},
     initial_step{initial_step_in}, nt_warp_multiplicity{nt_warp_multiplicity_in},
     electrostatic_cutoff{electrostatic_cutoff_in}, van_der_waals_cutoff{van_der_waals_cutoff_in},
-    vwu_progress{HybridKind::POINTER, "mm_vwu_counters"},
-    velocity_update_progress{HybridKind::POINTER, "mm_vupt_counters"},
-    velocity_constraint_progress{HybridKind::POINTER, "mm_vcns_counters"},
-    position_update_progress{HybridKind::POINTER, "mm_pupt_counters"},
-    geometry_constraint_progress{HybridKind::POINTER, "mm_gcns_counters"},
-    nbwu_progress{HybridKind::POINTER, "mm_nbwu_counters"},
-    pmewu_progress{HybridKind::POINTER, "mm_pmewu_counters"},
-    gbrwu_progress{HybridKind::POINTER, "mm_gbrwu_counters"},
-    gbdwu_progress{HybridKind::POINTER, "mm_gbdwu_counters"},
-    gather_wu_progress{HybridKind::POINTER, "mm_gtwu_counters"},
-    scatter_wu_progress{HybridKind::POINTER, "mm_scwu_counters"},
-    all_reduce_wu_progress{HybridKind::POINTER, "mm_rdwu_counters"},
-    int_data{24 * warp_size_int, "work_unit_prog_data"}
+    // FIX: All pointer Hybrids must use DECOUPLED to match int_data format
+    vwu_progress{HybridKind::POINTER, "mm_vwu_counters", HybridFormat::DECOUPLED},
+    velocity_update_progress{HybridKind::POINTER, "mm_vupt_counters", HybridFormat::DECOUPLED},
+    velocity_constraint_progress{HybridKind::POINTER, "mm_vcns_counters", HybridFormat::DECOUPLED},
+    position_update_progress{HybridKind::POINTER, "mm_pupt_counters", HybridFormat::DECOUPLED},
+    geometry_constraint_progress{HybridKind::POINTER, "mm_gcns_counters", HybridFormat::DECOUPLED},
+    nbwu_progress{HybridKind::POINTER, "mm_nbwu_counters", HybridFormat::DECOUPLED},
+    pmewu_progress{HybridKind::POINTER, "mm_pmewu_counters", HybridFormat::DECOUPLED},
+    gbrwu_progress{HybridKind::POINTER, "mm_gbrwu_counters", HybridFormat::DECOUPLED},
+    gbdwu_progress{HybridKind::POINTER, "mm_gbdwu_counters", HybridFormat::DECOUPLED},
+    gather_wu_progress{HybridKind::POINTER, "mm_gtwu_counters", HybridFormat::DECOUPLED},
+    scatter_wu_progress{HybridKind::POINTER, "mm_scwu_counters", HybridFormat::DECOUPLED},
+    all_reduce_wu_progress{HybridKind::POINTER, "mm_rdwu_counters", HybridFormat::DECOUPLED},
+    int_data{work_unit_payload_words + work_unit_guard_words, "work_unit_prog_data",
+             HybridFormat::DECOUPLED},
+    work_unit_guard_offset{work_unit_payload_words}
 {
+#if STORMM_USE_HPC && STORMM_MMCTRL_DEBUG
+  std::cerr << "DEBUG: MMControls ctor allocate work_unit_prog_data host="
+            << static_cast<const void*>(int_data.data()) << std::endl;
+#endif
   vwu_progress.setPointer(&int_data,                                  0, 2 * warp_size_int);
   velocity_update_progress.setPointer(&int_data,      2 * warp_size_int, 2 * warp_size_int);
   velocity_constraint_progress.setPointer(&int_data,  4 * warp_size_int, 2 * warp_size_int);
@@ -51,6 +69,7 @@ MolecularMechanicsControls::MolecularMechanicsControls(const double initial_step
   gather_wu_progress.setPointer(&int_data,           18 * warp_size_int, 2 * warp_size_int);
   scatter_wu_progress.setPointer(&int_data,          20 * warp_size_int, 2 * warp_size_int);
   all_reduce_wu_progress.setPointer(&int_data,       22 * warp_size_int, 2 * warp_size_int);
+  initializeWorkUnitGuards();
 }
 
 //-------------------------------------------------------------------------------------------------
@@ -90,9 +109,15 @@ MolecularMechanicsControls(const MolecularMechanicsControls &original) :
   gather_wu_progress{original.gather_wu_progress},
   scatter_wu_progress{original.scatter_wu_progress},
   all_reduce_wu_progress{original.all_reduce_wu_progress},
-  int_data{original.int_data}
+  int_data{original.int_data},
+  work_unit_guard_offset{original.work_unit_guard_offset}
 {
+#if STORMM_USE_HPC && STORMM_MMCTRL_DEBUG
+  std::cerr << "DEBUG: MMControls copy ctor work_unit_prog_data host="
+            << static_cast<const void*>(int_data.data()) << std::endl;
+#endif
   rebasePointers();
+  initializeWorkUnitGuards();
 }
 
 //-------------------------------------------------------------------------------------------------
@@ -123,9 +148,11 @@ MolecularMechanicsControls::operator=(const MolecularMechanicsControls &other) {
   scatter_wu_progress = other.scatter_wu_progress;
   all_reduce_wu_progress = other.all_reduce_wu_progress;
   int_data = other.int_data;
+  work_unit_guard_offset = other.work_unit_guard_offset;
 
   // Repair pointers and return the result
   rebasePointers();
+  initializeWorkUnitGuards();
   return *this;
 }
 
@@ -150,8 +177,24 @@ MolecularMechanicsControls::MolecularMechanicsControls(MolecularMechanicsControl
   gather_wu_progress{std::move(original.gather_wu_progress)},
   scatter_wu_progress{std::move(original.scatter_wu_progress)},
   all_reduce_wu_progress{std::move(original.all_reduce_wu_progress)},
-  int_data{std::move(original.int_data)}
-{}
+  int_data{std::move(original.int_data)},
+  work_unit_guard_offset{original.work_unit_guard_offset}
+{
+#if STORMM_USE_HPC && STORMM_MMCTRL_DEBUG
+  std::cerr << "DEBUG: MMControls move ctor work_unit_prog_data host="
+            << static_cast<const void*>(int_data.data()) << std::endl;
+#endif
+  initializeWorkUnitGuards();
+}
+
+//-------------------------------------------------------------------------------------------------
+MolecularMechanicsControls::~MolecularMechanicsControls() {
+  verifyWorkUnitGuards("~MolecularMechanicsControls");
+#if STORMM_MMCTRL_DEBUG
+  std::cout << "DEBUG: destroying MolecularMechanicsControls (step=" << step_number
+            << ") releasing work_unit_prog_data" << std::endl;
+#endif
+}
 
 //-------------------------------------------------------------------------------------------------
 MolecularMechanicsControls&
@@ -181,6 +224,8 @@ MolecularMechanicsControls::operator=(MolecularMechanicsControls &&other) {
   scatter_wu_progress = std::move(other.scatter_wu_progress);
   all_reduce_wu_progress = std::move(other.all_reduce_wu_progress);
   int_data = std::move(other.int_data);
+  work_unit_guard_offset = other.work_unit_guard_offset;
+  initializeWorkUnitGuards();
   return *this;
 }
 
@@ -420,6 +465,7 @@ void MolecularMechanicsControls::primeWorkUnitCounters(const CoreKlManager &laun
     scatter_wu_progress.putHost(scwu_block_count, i);
     all_reduce_wu_progress.putHost(rdwu_block_count, i);
   }
+  initializeWorkUnitGuards();
 #ifdef STORMM_USE_HPC
   upload();
 #endif
@@ -485,6 +531,79 @@ void MolecularMechanicsControls::download() {
   int_data.download();
 }
 #endif
+
+//-------------------------------------------------------------------------------------------------
+void MolecularMechanicsControls::initializeWorkUnitGuards() {
+  const size_t guard_start = work_unit_guard_offset;
+  const size_t guard_end = guard_start + static_cast<size_t>(work_unit_guard_words);
+  if (int_data.size() < guard_end) {
+    return;
+  }
+  for (size_t idx = guard_start; idx < guard_end; idx++) {
+    int_data.putHost(work_unit_guard_pattern, idx);
+  }
+#ifdef STORMM_USE_HPC
+  int_data.upload(guard_start, work_unit_guard_words);
+#endif
+}
+
+//-------------------------------------------------------------------------------------------------
+void MolecularMechanicsControls::verifyWorkUnitGuards(const char* context) {
+  const size_t guard_start = work_unit_guard_offset;
+  const size_t guard_end = guard_start + static_cast<size_t>(work_unit_guard_words);
+  if (int_data.size() < guard_end) {
+    return;
+  }
+  std::array<int, work_unit_guard_words> guard_values{};
+  bool copied_from_device = false;
+#ifdef STORMM_USE_HPC
+  const int* dev_ptr = int_data.data(HybridTargetLevel::DEVICE);
+  if (dev_ptr != nullptr) {
+    const int* dev_guard_ptr = dev_ptr + guard_start;
+    const cudaError_t copy_status =
+        cudaMemcpy(guard_values.data(), dev_guard_ptr,
+                   work_unit_guard_words * sizeof(int), cudaMemcpyDeviceToHost);
+    if (copy_status == cudaSuccess) {
+      copied_from_device = true;
+    }
+    else {
+#if STORMM_MMCTRL_DEBUG
+      std::cerr << "DEBUG: work_unit_prog_data guard cudaMemcpy failed during "
+                << (context != nullptr ? context : "unknown event")
+                << " : " << cudaGetErrorString(copy_status) << " ("
+                << static_cast<int>(copy_status) << ")" << std::endl;
+#endif
+    }
+  }
+#endif
+  if (!copied_from_device) {
+    const int* host_ptr = int_data.data();
+    if (host_ptr == nullptr) {
+      return;
+    }
+    for (size_t idx = 0; idx < static_cast<size_t>(work_unit_guard_words); idx++) {
+      guard_values[idx] = host_ptr[guard_start + idx];
+    }
+  }
+  bool corrupted = false;
+  for (size_t idx = 0; idx < static_cast<size_t>(work_unit_guard_words); idx++) {
+    if (guard_values[idx] != work_unit_guard_pattern) {
+      corrupted = true;
+      break;
+    }
+  }
+  if (corrupted) {
+#if STORMM_MMCTRL_DEBUG
+    std::cerr << "DEBUG: work_unit_prog_data guard corruption detected during "
+              << (context != nullptr ? context : "unknown event")
+              << " guard_start=" << guard_start
+              << " guard_words=" << work_unit_guard_words << std::endl;
+    for (size_t idx = 0; idx < static_cast<size_t>(work_unit_guard_words); idx++) {
+      std::cerr << "  guard[" << idx << "]=" << guard_values[idx] << std::endl;
+    }
+#endif
+  }
+}
 
 //-------------------------------------------------------------------------------------------------
 void MolecularMechanicsControls::rebasePointers() {
