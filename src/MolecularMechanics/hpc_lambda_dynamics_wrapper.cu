@@ -1,5 +1,8 @@
 // -*-c++-*-
 #include "copyright.h"
+#include <algorithm>
+#include <iostream>
+#include <memory>
 #include "Accelerator/hybrid.h"
 #include "Constants/behavior.h"
 #include "Math/series_ops.h"
@@ -177,7 +180,22 @@ ScoreCard launchLambdaDynamics(const AtomGraphSynthesis &poly_ag,
       AccumulationMethod::SPLIT,
       VwuGoal::MOVE_PARTICLES,
       ClashResponse::NONE);
-  CacheResource valence_cache(vale_lp.x, maximum_valence_work_unit_atoms);
+  static std::unique_ptr<CacheResource> valence_cache_ptr;
+  static int cached_valence_blocks = 0;
+  static int cached_valence_atoms = 0;
+  const int required_valence_blocks = vale_lp.x;
+  const int required_valence_atoms = maximum_valence_work_unit_atoms;
+  if (valence_cache_ptr == nullptr ||
+      cached_valence_blocks < required_valence_blocks ||
+      cached_valence_atoms < required_valence_atoms) {
+    cached_valence_blocks = std::max(cached_valence_blocks, required_valence_blocks);
+    cached_valence_atoms = std::max(cached_valence_atoms, required_valence_atoms);
+    valence_cache_ptr = std::make_unique<CacheResource>(
+        cached_valence_blocks, cached_valence_atoms);
+    std::cout << "# DEBUG hpc_lambda_dynamics: allocated valence CacheResource blocks="
+              << cached_valence_blocks << " atoms=" << cached_valence_atoms << std::endl;
+  }
+  CacheResource* valence_cache = valence_cache_ptr.get();
 
   const NbwuKind nb_work_type = poly_ag.getNonbondedWorkType();
   const ImplicitSolventModel gb_model = poly_ag.getImplicitSolventModel();
@@ -189,7 +207,22 @@ ScoreCard launchLambdaDynamics(const AtomGraphSynthesis &poly_ag,
       AccumulationMethod::SPLIT,
       gb_model,
       ClashResponse::NONE);
-  CacheResource nonb_cache(nonb_lp.x, small_block_max_atoms);
+  static std::unique_ptr<CacheResource> nonb_cache_ptr;
+  static int cached_nonb_blocks = 0;
+  static int cached_nonb_atoms = 0;
+  const int required_nonb_blocks = nonb_lp.x;
+  const int required_nonb_atoms = small_block_max_atoms;
+  if (nonb_cache_ptr == nullptr ||
+      cached_nonb_blocks < required_nonb_blocks ||
+      cached_nonb_atoms < required_nonb_atoms) {
+    cached_nonb_blocks = std::max(cached_nonb_blocks, required_nonb_blocks);
+    cached_nonb_atoms = std::max(cached_nonb_atoms, required_nonb_atoms);
+    nonb_cache_ptr = std::make_unique<CacheResource>(
+        cached_nonb_blocks, cached_nonb_atoms);
+    std::cout << "# DEBUG hpc_lambda_dynamics: allocated nonbonded CacheResource blocks="
+              << cached_nonb_blocks << " atoms=" << cached_nonb_atoms << std::endl;
+  }
+  CacheResource* nonb_cache = nonb_cache_ptr.get();
 
   // Create ScoreCard for energy tracking
   ScoreCard sc(n_systems, ((nstep + ntpr - 1) / ntpr) + 1, energy_bits);
@@ -230,8 +263,8 @@ ScoreCard launchLambdaDynamics(const AtomGraphSynthesis &poly_ag,
         &mmctrl,                    // MM controls (timestep, counters, integration mode)
         &sc,                        // ScoreCard - always pass (eval_energy flag controls computation)
         launcher,                   // Kernel launch manager
-        &valence_cache,             // Valence cache resource
-        &nonb_cache,                // Nonbonded cache resource
+        valence_cache,              // Valence cache resource
+        nonb_cache,                 // Nonbonded cache resource
         eval_energy,                // Energy evaluation flag (controls whether energies computed)
         nullptr,                    // GB workspace (nullptr = GB disabled)
         ImplicitSolventModel::NONE); // GB model (NONE for now)

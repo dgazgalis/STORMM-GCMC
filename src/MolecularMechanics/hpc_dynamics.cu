@@ -1,5 +1,8 @@
 // -*-c++-*-
 #include "copyright.h"
+#include <algorithm>
+#include <iostream>
+#include <memory>
 #include "FileManagement/file_enumerators.h"
 #include "Math/rounding.h"
 #include "Math/series_ops.h"
@@ -339,17 +342,78 @@ ScoreCard launchDynamics(const AtomGraphSynthesis &poly_ag,
   case UnitCellType::TRICLINIC:
     break;
   }
-  CacheResource vale_fe_cache(vale_fe_lp.x, maximum_valence_work_unit_atoms);
-  CacheResource vale_fx_cache(vale_fx_lp.x, maximum_valence_work_unit_atoms);
-  CacheResource nonb_fe_cache(nonb_fe_lp.x, small_block_max_atoms);
-  CacheResource nonb_fx_cache(nonb_fx_lp.x, small_block_max_atoms);
+  static std::unique_ptr<CacheResource> vale_fe_cache_ptr;
+  static std::unique_ptr<CacheResource> vale_fx_cache_ptr;
+  static std::unique_ptr<CacheResource> nonb_fe_cache_ptr;
+  static std::unique_ptr<CacheResource> nonb_fx_cache_ptr;
+  static int cached_vale_fe_blocks = 0, cached_vale_fe_atoms = 0;
+  static int cached_vale_fx_blocks = 0, cached_vale_fx_atoms = 0;
+  static int cached_nonb_fe_blocks = 0, cached_nonb_fe_atoms = 0;
+  static int cached_nonb_fx_blocks = 0, cached_nonb_fx_atoms = 0;
+
+  const int required_vale_fe_blocks = vale_fe_lp.x;
+  const int required_vale_fe_atoms = maximum_valence_work_unit_atoms;
+  if (vale_fe_cache_ptr == nullptr ||
+      cached_vale_fe_blocks < required_vale_fe_blocks ||
+      cached_vale_fe_atoms < required_vale_fe_atoms) {
+    cached_vale_fe_blocks = std::max(cached_vale_fe_blocks, required_vale_fe_blocks);
+    cached_vale_fe_atoms = std::max(cached_vale_fe_atoms, required_vale_fe_atoms);
+    vale_fe_cache_ptr = std::make_unique<CacheResource>(cached_vale_fe_blocks,
+                                                        cached_vale_fe_atoms);
+    std::cout << "# DEBUG hpc_dynamics: allocated vale_fe CacheResource blocks="
+              << cached_vale_fe_blocks << " atoms=" << cached_vale_fe_atoms << std::endl;
+  }
+
+  const int required_vale_fx_blocks = vale_fx_lp.x;
+  const int required_vale_fx_atoms = maximum_valence_work_unit_atoms;
+  if (vale_fx_cache_ptr == nullptr ||
+      cached_vale_fx_blocks < required_vale_fx_blocks ||
+      cached_vale_fx_atoms < required_vale_fx_atoms) {
+    cached_vale_fx_blocks = std::max(cached_vale_fx_blocks, required_vale_fx_blocks);
+    cached_vale_fx_atoms = std::max(cached_vale_fx_atoms, required_vale_fx_atoms);
+    vale_fx_cache_ptr = std::make_unique<CacheResource>(cached_vale_fx_blocks,
+                                                        cached_vale_fx_atoms);
+    std::cout << "# DEBUG hpc_dynamics: allocated vale_fx CacheResource blocks="
+              << cached_vale_fx_blocks << " atoms=" << cached_vale_fx_atoms << std::endl;
+  }
+
+  const int required_nonb_fe_blocks = nonb_fe_lp.x;
+  const int required_nonb_fe_atoms = small_block_max_atoms;
+  if (nonb_fe_cache_ptr == nullptr ||
+      cached_nonb_fe_blocks < required_nonb_fe_blocks ||
+      cached_nonb_fe_atoms < required_nonb_fe_atoms) {
+    cached_nonb_fe_blocks = std::max(cached_nonb_fe_blocks, required_nonb_fe_blocks);
+    cached_nonb_fe_atoms = std::max(cached_nonb_fe_atoms, required_nonb_fe_atoms);
+    nonb_fe_cache_ptr = std::make_unique<CacheResource>(cached_nonb_fe_blocks,
+                                                        cached_nonb_fe_atoms);
+    std::cout << "# DEBUG hpc_dynamics: allocated nonb_fe CacheResource blocks="
+              << cached_nonb_fe_blocks << " atoms=" << cached_nonb_fe_atoms << std::endl;
+  }
+
+  const int required_nonb_fx_blocks = nonb_fx_lp.x;
+  const int required_nonb_fx_atoms = small_block_max_atoms;
+  if (nonb_fx_cache_ptr == nullptr ||
+      cached_nonb_fx_blocks < required_nonb_fx_blocks ||
+      cached_nonb_fx_atoms < required_nonb_fx_atoms) {
+    cached_nonb_fx_blocks = std::max(cached_nonb_fx_blocks, required_nonb_fx_blocks);
+    cached_nonb_fx_atoms = std::max(cached_nonb_fx_atoms, required_nonb_fx_atoms);
+    nonb_fx_cache_ptr = std::make_unique<CacheResource>(cached_nonb_fx_blocks,
+                                                        cached_nonb_fx_atoms);
+    std::cout << "# DEBUG hpc_dynamics: allocated nonb_fx CacheResource blocks="
+              << cached_nonb_fx_blocks << " atoms=" << cached_nonb_fx_atoms << std::endl;
+  }
+
+  CacheResource* vale_fe_cache = vale_fe_cache_ptr.get();
+  CacheResource* vale_fx_cache = vale_fx_cache_ptr.get();
+  CacheResource* nonb_fe_cache = nonb_fe_cache_ptr.get();
+  CacheResource* nonb_fx_cache = nonb_fx_cache_ptr.get();
   
   // Create an implicit solvent workspace for this system.
   ImplicitSolventWorkspace ism_space(poly_ag.getSystemAtomOffsets(),
                                      poly_ag.getSystemAtomCounts(), nonbond_prec);
   launchDynamics(valence_prec, nonbond_prec, poly_ag, poly_se, tst, poly_ps, &mos, dyncon,
-                 &mmctrl_fe, &mmctrl_fx, &result, &vale_fe_cache, &vale_fx_cache, &nonb_fe_cache,
-                 &nonb_fx_cache, &ism_space, AccumulationMethod::SPLIT, sysc, syscmap, gpu,
+                 &mmctrl_fe, &mmctrl_fx, &result, vale_fe_cache, vale_fx_cache, nonb_fe_cache,
+                 nonb_fx_cache, &ism_space, AccumulationMethod::SPLIT, sysc, syscmap, gpu,
                  launcher, timer, task_name);
   return result;
 }

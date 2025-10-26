@@ -92,6 +92,9 @@ __global__ void kLambdaScaledNonbonded(
   // Get the actual atom index for this coupled atom
   const int i = coupled_indices[tid];
 
+  // FIX: Validate atom index is within bounds (safety check for corrupted coupled_indices)
+  if (i < 0 || i >= n_atoms) return;
+
   // Load atom i properties
   const double xi = (double)(xcrd[i]) * inv_gpos_scale;
   const double yi = (double)(ycrd[i]) * inv_gpos_scale;
@@ -119,6 +122,9 @@ __global__ void kLambdaScaledNonbonded(
   for (int j_tid = 0; j_tid < n_coupled; j_tid++) {
     // Get actual atom index for coupled atom j
     const int j = coupled_indices[j_tid];
+
+    // FIX: Validate j is within bounds (safety check for corrupted coupled_indices)
+    if (j < 0 || j >= n_atoms) continue;
 
     // Skip self-interaction
     if (i == j) continue;
@@ -975,6 +981,8 @@ void launchLambdaNonbonded(
   using synthesis::SeMaskSynthesisReader;
   using synthesis::SyNonbondedKit;
   using topology::UnitCellType;
+  using energy::supertile_length;
+  using energy::tile_length;
 
   const HybridTargetLevel tier = HybridTargetLevel::DEVICE;
   const int n_atoms = poly_ag.getAtomCount();
@@ -1001,7 +1009,10 @@ void launchLambdaNonbonded(
 
   // FIX: Read scalars from HOST-tier abstracts (system 0 for single-system GCMC)
   const int system_id = 0;  // GCMC typically operates on single system
-  const int supertile_stride = poly_ser_host.atom_counts[system_id];
+  const int n_supertiles = (poly_ser_host.atom_counts[system_id] + supertile_length - 1) /
+                           supertile_length;
+  const int supertile_base = poly_ser_host.supertile_map_bounds[system_id];
+  const int* d_supertile_map = poly_ser.supertile_map_idx + supertile_base;
   const int n_lj_types = nbk_host.n_lj_types[system_id];
   const int lj_offset = nbk_host.ljabc_offsets[system_id];
 
@@ -1015,15 +1026,23 @@ void launchLambdaNonbonded(
   // CRITICAL: Use static variables to avoid memory leak from repeated allocations
   // These are allocated once and reused across all GCMC cycles, preventing
   // cudaFreeHost failures from pinned memory fragmentation
+  //
+  // FIX: Pre-allocate to n_atoms (maximum possible n_coupled) to avoid resize fragmentation
+  // n_coupled varies dynamically with GCMC insertion/deletion, causing repeated reallocations
+  // if we resize to match n_coupled exactly. Pre-allocating to n_atoms is conservative but safe.
   static Hybrid<double> per_atom_elec(1, "per_atom_elec");
   static Hybrid<double> per_atom_vdw(1, "per_atom_vdw");
+  static int cached_n_atoms = 0;
+  static bool arrays_initialized = false;
 
-  // Resize if needed (only allocates if size changed)
-  if (per_atom_elec.size() != n_coupled) {
-    per_atom_elec.resize(n_coupled);
-    per_atom_vdw.resize(n_coupled);
+  // Only resize on first call or if n_atoms changes (topology change - rare)
+  if (!arrays_initialized || n_atoms != cached_n_atoms) {
+    per_atom_elec.resize(n_atoms);  // Use n_atoms, not n_coupled
+    per_atom_vdw.resize(n_atoms);
     per_atom_elec.upload();
     per_atom_vdw.upload();
+    cached_n_atoms = n_atoms;
+    arrays_initialized = true;
   }
 
   // Device scalars for GPU-reduced total energies
@@ -1057,9 +1076,9 @@ void launchLambdaNonbonded(
       n_lj_types,                  // Number of LJ types
       ljab_coeff_ptr,              // LJ A/B coefficients from topology
       poly_ser.mask_data,
-      poly_ser.supertile_map_idx,
+      d_supertile_map,
       poly_ser.tile_map_idx,
-      supertile_stride,
+      n_supertiles,
       psw.umat,
       unit_cell,
       coulomb_const,

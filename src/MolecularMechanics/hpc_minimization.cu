@@ -1,5 +1,8 @@
 // -*-c++-*-
 #include "copyright.h"
+#include <algorithm>
+#include <iostream>
+#include <memory>
 #include "Accelerator/ptx_macros.h"
 #include "Constants/hpc_bounds.h"
 #include "Constants/scaling.h"
@@ -648,19 +651,110 @@ extern ScoreCard launchMinimization(const AtomGraphSynthesis &poly_ag,
   MolecularMechanicsControls mmctrl_cdxe(mincon);
 
   // Prepare cache space for each kernel
-  CacheResource vale_fe_cache(vale_fe_lp.x, maximum_valence_work_unit_atoms);
-  CacheResource vale_xe_cache(vale_xe_lp.x, maximum_valence_work_unit_atoms);
-  CacheResource vale_cdfe_cache(vale_cdfe_lp.x, maximum_valence_work_unit_atoms);
-  CacheResource vale_cdxe_cache(vale_cdxe_lp.x, maximum_valence_work_unit_atoms);
-  CacheResource nonb_cache(nonb_lp.x, small_block_max_atoms);
-  CacheResource nonb_cd_cache(nonb_cdlp.x, small_block_max_atoms);
+  static std::unique_ptr<CacheResource> vale_fe_cache_ptr;
+  static std::unique_ptr<CacheResource> vale_xe_cache_ptr;
+  static std::unique_ptr<CacheResource> vale_cdfe_cache_ptr;
+  static std::unique_ptr<CacheResource> vale_cdxe_cache_ptr;
+  static std::unique_ptr<CacheResource> nonb_cache_ptr;
+  static std::unique_ptr<CacheResource> nonb_cd_cache_ptr;
+  static int cached_vale_fe_blocks = 0, cached_vale_fe_atoms = 0;
+  static int cached_vale_xe_blocks = 0, cached_vale_xe_atoms = 0;
+  static int cached_vale_cdfe_blocks = 0, cached_vale_cdfe_atoms = 0;
+  static int cached_vale_cdxe_blocks = 0, cached_vale_cdxe_atoms = 0;
+  static int cached_nonb_blocks = 0, cached_nonb_atoms = 0;
+  static int cached_nonb_cd_blocks = 0, cached_nonb_cd_atoms = 0;
+
+  const int required_vale_fe_blocks = vale_fe_lp.x;
+  const int required_vale_fe_atoms = maximum_valence_work_unit_atoms;
+  if (vale_fe_cache_ptr == nullptr ||
+      cached_vale_fe_blocks < required_vale_fe_blocks ||
+      cached_vale_fe_atoms < required_vale_fe_atoms) {
+    cached_vale_fe_blocks = std::max(cached_vale_fe_blocks, required_vale_fe_blocks);
+    cached_vale_fe_atoms = std::max(cached_vale_fe_atoms, required_vale_fe_atoms);
+    vale_fe_cache_ptr = std::make_unique<CacheResource>(cached_vale_fe_blocks,
+                                                        cached_vale_fe_atoms);
+    std::cout << "# DEBUG hpc_minimization: allocated vale_fe CacheResource blocks="
+              << cached_vale_fe_blocks << " atoms=" << cached_vale_fe_atoms << std::endl;
+  }
+
+  const int required_vale_xe_blocks = vale_xe_lp.x;
+  const int required_vale_xe_atoms = maximum_valence_work_unit_atoms;
+  if (vale_xe_cache_ptr == nullptr ||
+      cached_vale_xe_blocks < required_vale_xe_blocks ||
+      cached_vale_xe_atoms < required_vale_xe_atoms) {
+    cached_vale_xe_blocks = std::max(cached_vale_xe_blocks, required_vale_xe_blocks);
+    cached_vale_xe_atoms = std::max(cached_vale_xe_atoms, required_vale_xe_atoms);
+    vale_xe_cache_ptr = std::make_unique<CacheResource>(cached_vale_xe_blocks,
+                                                        cached_vale_xe_atoms);
+    std::cout << "# DEBUG hpc_minimization: allocated vale_xe CacheResource blocks="
+              << cached_vale_xe_blocks << " atoms=" << cached_vale_xe_atoms << std::endl;
+  }
+
+  const int required_vale_cdfe_blocks = vale_cdfe_lp.x;
+  const int required_vale_cdfe_atoms = maximum_valence_work_unit_atoms;
+  if (vale_cdfe_cache_ptr == nullptr ||
+      cached_vale_cdfe_blocks < required_vale_cdfe_blocks ||
+      cached_vale_cdfe_atoms < required_vale_cdfe_atoms) {
+    cached_vale_cdfe_blocks = std::max(cached_vale_cdfe_blocks, required_vale_cdfe_blocks);
+    cached_vale_cdfe_atoms = std::max(cached_vale_cdfe_atoms, required_vale_cdfe_atoms);
+    vale_cdfe_cache_ptr = std::make_unique<CacheResource>(cached_vale_cdfe_blocks,
+                                                          cached_vale_cdfe_atoms);
+    std::cout << "# DEBUG hpc_minimization: allocated vale_cdfe CacheResource blocks="
+              << cached_vale_cdfe_blocks << " atoms=" << cached_vale_cdfe_atoms << std::endl;
+  }
+
+  const int required_vale_cdxe_blocks = vale_cdxe_lp.x;
+  const int required_vale_cdxe_atoms = maximum_valence_work_unit_atoms;
+  if (vale_cdxe_cache_ptr == nullptr ||
+      cached_vale_cdxe_blocks < required_vale_cdxe_blocks ||
+      cached_vale_cdxe_atoms < required_vale_cdxe_atoms) {
+    cached_vale_cdxe_blocks = std::max(cached_vale_cdxe_blocks, required_vale_cdxe_blocks);
+    cached_vale_cdxe_atoms = std::max(cached_vale_cdxe_atoms, required_vale_cdxe_atoms);
+    vale_cdxe_cache_ptr = std::make_unique<CacheResource>(cached_vale_cdxe_blocks,
+                                                          cached_vale_cdxe_atoms);
+    std::cout << "# DEBUG hpc_minimization: allocated vale_cdxe CacheResource blocks="
+              << cached_vale_cdxe_blocks << " atoms=" << cached_vale_cdxe_atoms << std::endl;
+  }
+
+  const int required_nonb_blocks = nonb_lp.x;
+  const int required_nonb_atoms = small_block_max_atoms;
+  if (nonb_cache_ptr == nullptr ||
+      cached_nonb_blocks < required_nonb_blocks ||
+      cached_nonb_atoms < required_nonb_atoms) {
+    cached_nonb_blocks = std::max(cached_nonb_blocks, required_nonb_blocks);
+    cached_nonb_atoms = std::max(cached_nonb_atoms, required_nonb_atoms);
+    nonb_cache_ptr = std::make_unique<CacheResource>(cached_nonb_blocks,
+                                                     cached_nonb_atoms);
+    std::cout << "# DEBUG hpc_minimization: allocated nonb CacheResource blocks="
+              << cached_nonb_blocks << " atoms=" << cached_nonb_atoms << std::endl;
+  }
+
+  const int required_nonb_cd_blocks = nonb_cdlp.x;
+  const int required_nonb_cd_atoms = small_block_max_atoms;
+  if (nonb_cd_cache_ptr == nullptr ||
+      cached_nonb_cd_blocks < required_nonb_cd_blocks ||
+      cached_nonb_cd_atoms < required_nonb_cd_atoms) {
+    cached_nonb_cd_blocks = std::max(cached_nonb_cd_blocks, required_nonb_cd_blocks);
+    cached_nonb_cd_atoms = std::max(cached_nonb_cd_atoms, required_nonb_cd_atoms);
+    nonb_cd_cache_ptr = std::make_unique<CacheResource>(cached_nonb_cd_blocks,
+                                                        cached_nonb_cd_atoms);
+    std::cout << "# DEBUG hpc_minimization: allocated nonb_cd CacheResource blocks="
+              << cached_nonb_cd_blocks << " atoms=" << cached_nonb_cd_atoms << std::endl;
+  }
+
+  CacheResource* vale_fe_cache = vale_fe_cache_ptr.get();
+  CacheResource* vale_xe_cache = vale_xe_cache_ptr.get();
+  CacheResource* vale_cdfe_cache = vale_cdfe_cache_ptr.get();
+  CacheResource* vale_cdxe_cache = vale_cdxe_cache_ptr.get();
+  CacheResource* nonb_cache = nonb_cache_ptr.get();
+  CacheResource* nonb_cd_cache = nonb_cd_cache_ptr.get();
   ImplicitSolventWorkspace ism_space(poly_ag.getSystemAtomOffsets(),
                                      poly_ag.getSystemAtomCounts(), prec);
   ReductionBridge poly_rbg(poly_ag.getReductionWorkUnitCount());
   LineMinimization line_record(poly_ag.getSystemCount());
   launchMinimization(prec, poly_ag, poly_se, poly_ps, mincon, &mmctrl_fe, &mmctrl_xe, &mmctrl_cdfe,
-                     &mmctrl_cdxe, &result, &vale_fe_cache, &vale_xe_cache, &vale_cdfe_cache,
-                     &vale_cdxe_cache, &nonb_cache, &nonb_cd_cache, &ism_space, &poly_rbg,
+                     &mmctrl_cdxe, &result, vale_fe_cache, vale_xe_cache, vale_cdfe_cache,
+                     vale_cdxe_cache, nonb_cache, nonb_cd_cache, &ism_space, &poly_rbg,
                      &line_record, chooseAccumulationMethod(poly_ps->getForceAccumulationBits()),
                      gpu, launcher, timer, task_name);
   return result;

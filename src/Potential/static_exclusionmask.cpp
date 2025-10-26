@@ -1,4 +1,6 @@
 #include <algorithm>
+#include <string>
+#include <unordered_map>
 #include "copyright.h"
 #include "static_exclusionmask.h"
 
@@ -52,8 +54,14 @@ StaticExclusionMask::StaticExclusionMask(const AtomGraph *ag_in) :
 
   // Initialize the first (blank) tile: 32 unsigned integers set to zero, to which all tiles in
   // the blank supertile will index, indicating that there are no exclusions.
-  std::vector<uint> tmp_masks(2 * tile_length, 0);
+  std::vector<uint> unique_tile_masks(2 * tile_length, 0U);
   std::vector<int> tmp_tile_map_indices(tiles_per_supertile, 0);
+  std::unordered_map<std::string, int> tile_library;
+  tile_library.reserve(1024);
+
+  const std::string blank_tile_key(2 * tile_length * sizeof(uint), '\0');
+  tile_library.emplace(blank_tile_key, 0);
+
   int n_unique_supertiles = 1;
   int n_unique_tiles = 1;
 
@@ -107,7 +115,6 @@ StaticExclusionMask::StaticExclusionMask(const AtomGraph *ag_in) :
 
       // Otherwise, this supertile has some exclusion somewhere within it, which means that
       // at least 256 indices to individual tile exclusion maps must be supplied.
-      tmp_supertile_map_indices[(stj * supertile_stride_count) + sti] = n_unique_supertiles * 256;
       std::vector<int> this_supertile_map(tiles_per_supertile, 0);
 
       // Within this supertile, count the number of unique tiles and log them in the master
@@ -215,17 +222,28 @@ StaticExclusionMask::StaticExclusionMask(const AtomGraph *ag_in) :
 
           // Log this tile mask if an exclusion was found
           if (excl_found) {
-            tmp_masks.insert(tmp_masks.end(), mask_buffer.begin(), mask_buffer.end());
-            this_supertile_map[(tj * tile_lengths_per_supertile) + ti] = n_unique_tiles *
-                                                                         2 * tile_length;
-            n_unique_tiles++;
-            if (n_unique_tiles > max_unique_tiles) {
-              rtErr("The maximum number of unique 16 x 16 atom tile masks has been exceeded.  A "
-                    "system may create no more than (2^26) - 1 unique tile masks containing "
-                    "exclusions, about 67 million or enough to accommodate a system of 11.8 "
-                    "million atoms (the maximum system size) with every group of 16 atoms "
-                    "sharing exclusions with up to 90 others.", "StaticExclusionMask");
+            const std::string mask_key(reinterpret_cast<const char*>(mask_buffer.data()),
+                                       mask_buffer.size() * sizeof(uint));
+            auto tile_it = tile_library.find(mask_key);
+            int mask_offset;
+            if (tile_it == tile_library.end()) {
+              mask_offset = static_cast<int>(unique_tile_masks.size());
+              unique_tile_masks.insert(unique_tile_masks.end(), mask_buffer.begin(),
+                                       mask_buffer.end());
+              tile_library.emplace(mask_key, mask_offset);
+              n_unique_tiles++;
+              if (n_unique_tiles > max_unique_tiles) {
+                rtErr("The maximum number of unique 16 x 16 atom tile masks has been exceeded.  A "
+                      "system may create no more than (2^26) - 1 unique tile masks containing "
+                      "exclusions, about 67 million or enough to accommodate a system of 11.8 "
+                      "million atoms (the maximum system size) with every group of 16 atoms "
+                      "sharing exclusions with up to 90 others.", "StaticExclusionMask");
+              }
             }
+            else {
+              mask_offset = tile_it->second;
+            }
+            this_supertile_map[(tj * tile_lengths_per_supertile) + ti] = mask_offset;
           }
         }
       }
@@ -249,6 +267,8 @@ StaticExclusionMask::StaticExclusionMask(const AtomGraph *ag_in) :
       //       for the current tile assignment.
       tmp_tile_map_indices.insert(tmp_tile_map_indices.end(), this_supertile_map.begin(),
                                   this_supertile_map.end());
+      tmp_supertile_map_indices[(stj * supertile_stride_count) + sti] =
+          n_unique_supertiles * tiles_per_supertile;
       n_unique_supertiles++;
     }
   }
@@ -258,12 +278,12 @@ StaticExclusionMask::StaticExclusionMask(const AtomGraph *ag_in) :
   // system size).
   unique_supertile_count = n_unique_supertiles;
   unique_tile_count = n_unique_tiles;
-  all_masks.resize(unique_tile_count * 2 * tile_length);
+  all_masks.resize(unique_tile_masks.size());
   supertile_map_indices.resize(supertile_stride_count * supertile_stride_count);
-  tile_map_indices.resize(unique_supertile_count * tiles_per_supertile);
+  tile_map_indices.resize(tmp_tile_map_indices.size());
 
   // Load the object
-  all_masks.putHost(tmp_masks);
+  all_masks.putHost(unique_tile_masks);
   supertile_map_indices.putHost(tmp_supertile_map_indices);
   tile_map_indices.putHost(tmp_tile_map_indices);
 }
@@ -311,8 +331,7 @@ int StaticExclusionMask::getUniqueTileCount(const int supertile_i_index,
     return 0;
   }
   else {
-    const int offset = tiles_per_supertile * sptl_map_index;
-    const int* tilemap_ptr = tile_map_indices.data();
+    const int* tilemap_ptr = tile_map_indices.data() + sptl_map_index;
     int result = 0;
     for (int i = 0; i < tiles_per_supertile; i++) {
       result += (tilemap_ptr[i] > 0);

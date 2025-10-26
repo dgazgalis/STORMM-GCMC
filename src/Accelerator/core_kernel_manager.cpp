@@ -195,6 +195,41 @@ CoreKlManager::CoreKlManager(const GpuDetails &gpu_in, const AtomGraphSynthesis 
         break;
       case UnitCellType::ORTHORHOMBIC:
       case UnitCellType::TRICLINIC:
+        // FIX: Catalog the same kernels for periodic systems
+        // The kernels handle PBC at runtime via unit_cell parameter and minimum image convention
+        // Using "Vacuum" label here means "no implicit solvent", not "non-periodic"
+        catalogNonbondedKernel(PrecisionModel::DOUBLE, NbwuKind::TILE_GROUPS, EvaluateForce::NO,
+                               EvaluateEnergy::YES, AccumulationMethod::SPLIT, is_models[j],
+                               clash_policy[i],
+                               "ktgd" + is_model_names[j] + "Energy" + clash_ext[i]);
+        catalogNonbondedKernel(PrecisionModel::DOUBLE, NbwuKind::TILE_GROUPS, EvaluateForce::YES,
+                               EvaluateEnergy::NO, AccumulationMethod::SPLIT, is_models[j],
+                               clash_policy[i],
+                               "ktgds" + is_model_names[j] + "Force" + clash_ext[i]);
+        catalogNonbondedKernel(PrecisionModel::DOUBLE, NbwuKind::TILE_GROUPS, EvaluateForce::YES,
+                               EvaluateEnergy::YES, AccumulationMethod::SPLIT, is_models[j],
+                               clash_policy[i],
+                               "ktgds" + is_model_names[j] + "ForceEnergy" + clash_ext[i]);
+        catalogNonbondedKernel(PrecisionModel::SINGLE, NbwuKind::TILE_GROUPS, EvaluateForce::NO,
+                               EvaluateEnergy::YES, AccumulationMethod::SPLIT, is_models[j],
+                               clash_policy[i],
+                               "ktgf" + is_model_names[j] + "Energy" + clash_ext[i]);
+        catalogNonbondedKernel(PrecisionModel::SINGLE, NbwuKind::TILE_GROUPS, EvaluateForce::YES,
+                               EvaluateEnergy::NO, AccumulationMethod::SPLIT, is_models[j],
+                               clash_policy[i],
+                               "ktgfs" + is_model_names[j] + "Force" + clash_ext[i]);
+        catalogNonbondedKernel(PrecisionModel::SINGLE, NbwuKind::TILE_GROUPS, EvaluateForce::YES,
+                               EvaluateEnergy::NO, AccumulationMethod::WHOLE, is_models[j],
+                               clash_policy[i],
+                               "ktgfs" + is_model_names[j] + "Force" + clash_ext[i]);
+        catalogNonbondedKernel(PrecisionModel::SINGLE, NbwuKind::TILE_GROUPS, EvaluateForce::YES,
+                               EvaluateEnergy::YES, AccumulationMethod::SPLIT, is_models[j],
+                               clash_policy[i],
+                               "ktgfs" + is_model_names[j] + "ForceEnergy" + clash_ext[i]);
+        catalogNonbondedKernel(PrecisionModel::SINGLE, NbwuKind::TILE_GROUPS, EvaluateForce::YES,
+                               EvaluateEnergy::YES, AccumulationMethod::WHOLE, is_models[j],
+                               clash_policy[i],
+                               "ktgfs" + is_model_names[j] + "ForceEnergy" + clash_ext[i]);
         break;
       }
     }

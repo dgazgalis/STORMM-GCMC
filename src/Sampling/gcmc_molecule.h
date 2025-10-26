@@ -55,6 +55,12 @@ struct GCMCMolecule {
   std::vector<double> original_sigma;      ///< Original LJ sigma parameters (Angstroms)
   std::vector<double> original_epsilon;    ///< Original LJ epsilon parameters (kcal/mol)
 
+  /// \brief GPU-side cache flag
+  ///
+  /// Set to true after atom_indices have been uploaded to GPU once.
+  /// This allows GPU-side lambda modifications without repeated uploads.
+  bool gpu_indices_cached;                 ///< Flag indicating if GPU cache is valid
+
   /// \brief Check if the molecule is currently active (lambda = 1.0)
   ///
   /// \return True if the molecule is fully coupled (both lambda values = 1.0)

@@ -7,6 +7,7 @@
 #include "Accelerator/gpu_details.h"
 #include "Accelerator/hybrid.h"
 #include "Constants/behavior.h"
+#include "Constants/hpc_bounds.h"
 #include "Potential/energy_enumerators.h"
 #include "Potential/cellgrid.h"
 #include "Math/reduction_enumerators.h"
@@ -24,6 +25,8 @@ using card::CoreKlManager;
 using card::Hybrid;
 using card::HybridTargetLevel;
 using constants::PrecisionModel;
+using constants::twice_warp_size_int;
+using constants::warp_size_int;
 using energy::CellGrid;
 using energy::ClashResponse;
 using energy::EvaluateEnergy;
@@ -136,6 +139,9 @@ public:
   ///
   /// \param original  The object from which to take contents
   MolecularMechanicsControls(MolecularMechanicsControls &&original);
+
+  /// \brief Destructor logs when the progress buffers are released (debug aid).
+  ~MolecularMechanicsControls();
 
   /// \brief Get the current step number.
   int getStepNumber() const;
@@ -356,10 +362,16 @@ private:
 
   /// ARRAY-kind Hybrid object targeted by the above POINTER-kind Hybrid objects
   Hybrid<int> int_data;
+  static constexpr int work_unit_payload_words = 24 * warp_size_int;
+  static constexpr int work_unit_guard_words   = warp_size_int;
+  static constexpr int work_unit_guard_pattern = 0x6badc0de;
+  size_t work_unit_guard_offset;
 
   /// \brief Re-assign pointers to reference the object's private integer array data.  This is
   ///        invoked after a copy construction or copy assignment.
   void rebasePointers();
+  void initializeWorkUnitGuards();
+  void verifyWorkUnitGuards(const char* context);
 };
 
 } // namespace mm

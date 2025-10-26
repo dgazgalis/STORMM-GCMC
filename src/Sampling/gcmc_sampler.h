@@ -251,6 +251,20 @@ public:
   /// \param mol  Molecule to apply PBC to
   void applyPBC(const GCMCMolecule& mol);
 
+  /// \brief Adjust lambda parameters for a specific molecule (GPU path)
+  ///
+  /// Updates lambda values directly on GPU, eliminating CPU→GPU uploads.
+  /// Uses CUDA kernels to modify per-atom lambda arrays in device memory.
+  /// For two-stage coupling: VDW first (0-0.75), then electrostatics (0.75-1.0).
+  ///
+  /// This is the optimized path that eliminates 600+ memory uploads per 100 cycles.
+  /// Falls back to CPU path if CUDA not available or launcher_ is nullptr.
+  /// Made public for helper function access.
+  ///
+  /// \param mol        Molecule to adjust
+  /// \param new_lambda New lambda value [0, 1]
+  void adjustMoleculeLambdaGPU(GCMCMolecule& mol, double new_lambda);
+
   /// \brief Get GPU workspace for MC move atom indices
   ///
   /// \return Reference to Hybrid array for atom indices (pre-allocate before use)
@@ -283,7 +297,7 @@ public:
 
 protected:
 
-  /// \brief Adjust lambda parameters for a specific molecule
+  /// \brief Adjust lambda parameters for a specific molecule (CPU path)
   ///
   /// Updates both the molecule's lambda values and the AtomGraph charge array.
   /// For two-stage coupling: VDW first (0-0.75), then electrostatics (0.75-1.0).
@@ -291,6 +305,15 @@ protected:
   /// \param mol        Molecule to adjust
   /// \param new_lambda New lambda value [0, 1]
   void adjustMoleculeLambda(GCMCMolecule& mol, double new_lambda);
+
+  /// \brief Ensure the coupled atom index list matches current lambda state
+  ///
+  /// Rebuilds the coupled index list if lambda values changed and returns the
+  /// number of coupled atoms that exceed the active threshold.
+  ///
+  /// \param download_to_host  If true, download updated indices to host memory
+  /// \return Number of coupled atoms
+  int ensureCoupledAtomList(bool download_to_host = false);
 
   /// \brief Select a random ghost molecule for insertion
   ///
@@ -368,7 +391,8 @@ protected:
   /// All nullptr for non-periodic systems (cutoff electrostatics only)
   AtomGraphSynthesis* topology_synthesis_;              ///< Topology synthesis (owned)
   PhaseSpaceSynthesis* ps_synthesis_;                   ///< Phase space synthesis (owned)
-  CellGrid<double, double, double, double4>* cell_grid_;  ///< Spatial decomposition (owned)
+  // FIX: Use llint for accumulator (neighbor list images require integers in PBC)
+  CellGrid<double, llint, double, double4>* cell_grid_;  ///< Spatial decomposition (owned)
   PMIGrid* pme_grid_;                                   ///< PME grid (owned)
   double ewald_coeff_;                                  ///< Ewald coefficient for PME direct space (0.0 for non-periodic)
 
@@ -377,15 +401,15 @@ protected:
   /// These objects enable the new launchLambdaDynamicsStep() API:
   /// - se_synthesis_: Exclusion mask synthesis wrapping exclusions_
   /// - launcher_: GPU kernel launch manager
-  /// - valence_cache_: Cache resource for valence kernels
-  /// - nonb_cache_: Cache resource for nonbonded kernels
   /// - mmctrl_: Molecular mechanics controls (timestep, integration mode)
+  ///
+  /// NOTE: CacheResource objects are now created locally in evaluateTotalEnergy()
+  /// and propagateSystem() to avoid CUDA pinned memory fragmentation issues.
+  /// This follows the same pattern as regular STORMM dynamics.
   ///
   /// All created in constructor if CUDA is available, nullptr otherwise
   StaticExclusionMaskSynthesis* se_synthesis_;  ///< Exclusion mask synthesis (owned)
   CoreKlManager* launcher_;                     ///< GPU kernel launcher (owned)
-  CacheResource* valence_cache_;                ///< Valence kernel cache (owned)
-  CacheResource* nonb_cache_;                   ///< Nonbonded kernel cache (owned)
   MolecularMechanicsControls* mmctrl_;          ///< MD integration controls (owned)
 
   /// \brief Energy cache to avoid redundant evaluations
@@ -465,6 +489,23 @@ protected:
   Hybrid<double> mc_saved_z_;        ///< Backup Z coordinates (GPU/CPU)
   Hybrid<double> mc_rotation_matrix_; ///< 3x3 rotation matrix for rotation/torsion moves (GPU/CPU, size=9)
   Hybrid<int> mc_rotating_atoms_;    ///< Atom indices for torsion rotation (GPU/CPU)
+
+  /// \brief GPU-side cache for molecule atom indices (eliminates repeated uploads)
+  ///
+  /// This Hybrid array caches atom indices for a molecule on GPU to enable direct
+  /// GPU-side lambda modifications without CPU→GPU transfers. Reused across all
+  /// lambda modification calls during GCMC cycles.
+  /// Pre-allocated to maximum molecule size for efficiency.
+  Hybrid<int> gpu_molecule_indices_; ///< GPU-cached atom indices for lambda operations (GPU/CPU)
+
+  /// \brief Flag to track if lambda arrays are up-to-date on GPU
+  ///
+  /// Set to true after adjustMoleculeLambdaGPU() modifies lambda values on GPU.
+  /// Set to false after evaluateTotalEnergy() rebuilds coupled indices.
+  /// When true, evaluateTotalEnergy() skips lambda array uploads and rebuilds coupled indices on GPU.
+  bool gpu_lambda_arrays_dirty_; ///< Flag indicating GPU lambda arrays need coupled indices rebuild
+  bool coupled_indices_valid_;   ///< Track whether coupled_indices_ matches current lambda values
+  int coupled_atom_count_;       ///< Cached coupled atom count from latest rebuild
 };
 
 /// \brief GCMC sampler with spherical sampling region

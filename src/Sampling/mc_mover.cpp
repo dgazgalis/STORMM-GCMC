@@ -119,19 +119,22 @@ bool TranslationMover::attemptMove(GCMCMolecule& mol) {
 
   // 1. Prepare atom indices on GPU
   Hybrid<int>& atom_indices = sampler_->getMCAtomIndices();
-  atom_indices.resize(mol.atom_indices.size());
+  // FIX: Don't resize - use pre-allocated workspace (avoids CUDA pinned memory fragmentation)
+  if (mol.atom_indices.size() > atom_indices.size()) {
+    rtErr("Molecule has " + std::to_string(mol.atom_indices.size()) +
+          " atoms but MC workspace only allocated for " + std::to_string(atom_indices.size()),
+          "TranslationMover::attemptMove");
+  }
   for (size_t i = 0; i < mol.atom_indices.size(); i++) {
     atom_indices.data()[i] = mol.atom_indices[i];
   }
-  atom_indices.upload();
+  atom_indices.upload(0, mol.atom_indices.size());
 
   // 2. Backup coordinates on GPU
   Hybrid<double>& saved_x = sampler_->getMCSavedX();
   Hybrid<double>& saved_y = sampler_->getMCSavedY();
   Hybrid<double>& saved_z = sampler_->getMCSavedZ();
-  saved_x.resize(mol.atom_indices.size());
-  saved_y.resize(mol.atom_indices.size());
-  saved_z.resize(mol.atom_indices.size());
+  // FIX: Don't resize - use pre-allocated workspace (already validated above)
 
   launchBackupCoordinates(
       mol.atom_indices.size(),
@@ -372,15 +375,20 @@ bool RotationMover::attemptMove(GCMCMolecule& mol) {
 
   // 1. Prepare atom indices on GPU
   Hybrid<int>& atom_indices = sampler_->getMCAtomIndices();
-  atom_indices.resize(mol.atom_indices.size());
+  // FIX: Don't resize - use pre-allocated workspace (avoids CUDA pinned memory fragmentation)
+  if (mol.atom_indices.size() > atom_indices.size()) {
+    rtErr("Molecule has " + std::to_string(mol.atom_indices.size()) +
+          " atoms but MC workspace only allocated for " + std::to_string(atom_indices.size()),
+          "RotationMover::attemptMove");
+  }
   for (size_t i = 0; i < mol.atom_indices.size(); i++) {
     atom_indices.data()[i] = mol.atom_indices[i];
   }
-  atom_indices.upload();
+  atom_indices.upload(0, mol.atom_indices.size());
 
   // 2. Upload rotation matrix to GPU
   Hybrid<double>& gpu_rot_matrix = sampler_->getMCRotationMatrix();
-  gpu_rot_matrix.resize(9);
+  // FIX: Don't resize - rotation matrix is always 3x3=9 elements (pre-allocated)
   for (int i = 0; i < 9; i++) {
     gpu_rot_matrix.data()[i] = rot_matrix[i];
   }
@@ -390,9 +398,7 @@ bool RotationMover::attemptMove(GCMCMolecule& mol) {
   Hybrid<double>& saved_x = sampler_->getMCSavedX();
   Hybrid<double>& saved_y = sampler_->getMCSavedY();
   Hybrid<double>& saved_z = sampler_->getMCSavedZ();
-  saved_x.resize(mol.atom_indices.size());
-  saved_y.resize(mol.atom_indices.size());
-  saved_z.resize(mol.atom_indices.size());
+  // FIX: Don't resize - use pre-allocated workspace (already validated above)
 
   launchBackupCoordinates(
       mol.atom_indices.size(),
@@ -749,15 +755,20 @@ bool TorsionMover::attemptMove(GCMCMolecule& mol) {
 
   // 1. Prepare rotating atom indices on GPU
   Hybrid<int>& rotating_atoms = sampler_->getMCRotatingAtoms();
-  rotating_atoms.resize(bond.rotating_atoms.size());
+  // FIX: Don't resize - use pre-allocated workspace (avoids CUDA pinned memory fragmentation)
+  if (bond.rotating_atoms.size() > rotating_atoms.size()) {
+    rtErr("Rotating atoms " + std::to_string(bond.rotating_atoms.size()) +
+          " exceeds MC workspace size " + std::to_string(rotating_atoms.size()),
+          "TorsionMover::attemptMove");
+  }
   for (size_t i = 0; i < bond.rotating_atoms.size(); i++) {
     rotating_atoms.data()[i] = bond.rotating_atoms[i];
   }
-  rotating_atoms.upload();
+  rotating_atoms.upload(0, bond.rotating_atoms.size());
 
   // 2. Upload rotation matrix to GPU
   Hybrid<double>& gpu_rot_matrix = sampler_->getMCRotationMatrix();
-  gpu_rot_matrix.resize(9);
+  // FIX: Don't resize - rotation matrix is always 3x3=9 elements (pre-allocated)
   for (int i = 0; i < 9; i++) {
     gpu_rot_matrix.data()[i] = rot_matrix[i];
   }
@@ -765,18 +776,21 @@ bool TorsionMover::attemptMove(GCMCMolecule& mol) {
 
   // 3. Backup coordinates on GPU (backup all molecule atoms)
   Hybrid<int>& atom_indices = sampler_->getMCAtomIndices();
-  atom_indices.resize(mol.atom_indices.size());
+  // FIX: Don't resize - use pre-allocated workspace (avoids CUDA pinned memory fragmentation)
+  if (mol.atom_indices.size() > atom_indices.size()) {
+    rtErr("Molecule has " + std::to_string(mol.atom_indices.size()) +
+          " atoms but MC workspace only allocated for " + std::to_string(atom_indices.size()),
+          "TorsionMover::attemptMove");
+  }
   for (size_t i = 0; i < mol.atom_indices.size(); i++) {
     atom_indices.data()[i] = mol.atom_indices[i];
   }
-  atom_indices.upload();
+  atom_indices.upload(0, mol.atom_indices.size());
 
   Hybrid<double>& saved_x = sampler_->getMCSavedX();
   Hybrid<double>& saved_y = sampler_->getMCSavedY();
   Hybrid<double>& saved_z = sampler_->getMCSavedZ();
-  saved_x.resize(mol.atom_indices.size());
-  saved_y.resize(mol.atom_indices.size());
-  saved_z.resize(mol.atom_indices.size());
+  // FIX: Don't resize - use pre-allocated workspace (already validated above)
 
   launchBackupCoordinates(
       mol.atom_indices.size(),
