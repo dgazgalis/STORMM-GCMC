@@ -1296,10 +1296,10 @@ double GCMCSampler::evaluateTotalEnergy() {
     if (!initialized) {
       energy_mmctrl.primeWorkUnitCounters(
           *launcher_,
-          EvaluateForce::NO,   // Don't need forces for energy evaluation
-          energy::EvaluateEnergy::YES, // DO evaluate energy
+          EvaluateForce::YES,
+          energy::EvaluateEnergy::YES,
           energy::ClashResponse::NONE,
-          synthesis::VwuGoal::ACCUMULATE, // Accumulate mode (no integration)
+          synthesis::VwuGoal::ACCUMULATE,
           constants::PrecisionModel::DOUBLE,
           constants::PrecisionModel::DOUBLE,
           *topology_synthesis_);
@@ -1311,7 +1311,7 @@ double GCMCSampler::evaluateTotalEnergy() {
     // This prevents CUDA pinned memory fragmentation from 100s of alloc/free cycles
     const int2 vale_lp = launcher_->getValenceKernelDims(
         constants::PrecisionModel::DOUBLE,
-        EvaluateForce::NO,
+        EvaluateForce::YES,
         energy::EvaluateEnergy::YES,
         energy::AccumulationMethod::SPLIT,
         synthesis::VwuGoal::ACCUMULATE,
@@ -1319,7 +1319,7 @@ double GCMCSampler::evaluateTotalEnergy() {
     const int2 nonb_lp = launcher_->getNonbondedKernelDims(
         constants::PrecisionModel::DOUBLE,
         topology_synthesis_->getNonbondedWorkType(),
-        EvaluateForce::NO,
+        EvaluateForce::YES,
         energy::EvaluateEnergy::YES,
         energy::AccumulationMethod::SPLIT,
         topology_synthesis_->getImplicitSolventModel(),

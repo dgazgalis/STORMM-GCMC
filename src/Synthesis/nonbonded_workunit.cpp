@@ -742,8 +742,8 @@ buildNonbondedWorkUnits(const StaticExclusionMaskSynthesis &poly_se,
     result = enumerateNonbondedWorkUnits(poly_se, large_nbwu_tiles, large_wu_count, atom_counts,
                                          atom_offsets);
   }
-  else {    
-    result = enumerateNonbondedWorkUnits(poly_se, huge_nbwu_tiles, huge_wu_count, atom_counts,
+  else {
+    result = enumerateNonbondedWorkUnits(poly_se, large_nbwu_tiles, large_wu_count, atom_counts,
                                          atom_offsets);
   }
   
@@ -782,7 +782,7 @@ buildNonbondedWorkUnits(const StaticExclusionMask &se, const InitializationTask 
                                          atom_offsets);
   }
   else {
-    result = enumerateNonbondedWorkUnits(se, huge_nbwu_tiles, huge_wu_count, atom_counts,
+    result = enumerateNonbondedWorkUnits(se, large_nbwu_tiles, large_wu_count, atom_counts,
                                          atom_offsets);
   }
 

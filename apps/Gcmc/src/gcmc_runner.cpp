@@ -8,6 +8,8 @@
 #include <string>
 #include <unordered_set>
 #include <vector>
+#include <filesystem>
+#include <numeric>
 #include "../../../src/copyright.h"
 #ifdef STORMM_USE_HPC
 #  include "../../../src/Accelerator/core_kernel_manager.h"
@@ -15,6 +17,7 @@
 #  include "../../../src/Accelerator/hpc_config.h"
 #endif
 #include "../../../src/Chemistry/chemistry_enumerators.h"
+#include "../../../src/Chemistry/znumber.h"
 #include "../../../src/Constants/behavior.h"
 #include "../../../src/DataTypes/common_types.h"
 #include "../../../src/DataTypes/stormm_vector_types.h"
@@ -83,7 +86,8 @@ void writeConfigFile(const std::string& filename,
                      double mu_ex, double standard_volume, bool overwrite,
                      const std::string& mode, double box_size, bool freeze_fragments,
                      bool save_trajectory, int snapshot_interval, const std::string& trajectory_prefix,
-                     double mc_translation, double mc_rotation, double mc_torsion, int mc_frequency) {
+                     double mc_translation, double mc_rotation, double mc_torsion, int mc_frequency,
+                     const std::string& final_pdb_path, bool final_pdb_active_only) {
 
   std::ofstream config(filename);
   if (!config.is_open()) {
@@ -168,6 +172,12 @@ void writeConfigFile(const std::string& filename,
     config << "--snapshot-interval " << snapshot_interval << "\n";
     config << "--trajectory-prefix " << trajectory_prefix << "\n";
   }
+  if (!final_pdb_path.empty() && final_pdb_path != "none") {
+    config << "--final-pdb " << final_pdb_path << "\n";
+  }
+  if (final_pdb_active_only) {
+    config << "--final-pdb-active-only\n";
+  }
   config << "\n";
 
   config.close();
@@ -204,6 +214,76 @@ void readConfigFile(const std::string& filename, std::vector<std::string>& args)
 
   config.close();
   std::cout << "Read configuration from: " << filename << "\n";
+}
+
+//-------------------------------------------------------------------------------------------------
+// Helper to write a PDB snapshot for selected atoms
+//-------------------------------------------------------------------------------------------------
+void writePdbSnapshot(const std::string& filename,
+                      const AtomGraph& topology,
+                      const PhaseSpace& phase_space,
+                      const std::vector<int>& atom_indices,
+                      const std::string& empty_message,
+                      bool overwrite)
+{
+  if (!overwrite && std::filesystem::exists(filename)) {
+    rtErr("PDB file '" + filename + "' already exists.  Use -O or remove the file before rerunning.",
+          "writePdbSnapshot");
+  }
+
+  std::ofstream pdb_file(filename, std::ios::trunc);
+  if (!pdb_file.is_open()) {
+    rtErr("Unable to open PDB file '" + filename + "' for writing.", "writePdbSnapshot");
+  }
+
+  const PhaseSpaceReader psr = phase_space.data();
+  pdb_file << std::fixed << std::setprecision(3);
+
+  // Write box information if available
+  pdb_file << "CRYST1"
+           << std::setw(9) << psr.boxdim[0]
+           << std::setw(9) << psr.boxdim[1]
+           << std::setw(9) << psr.boxdim[2]
+           << std::setw(7) << psr.boxdim[3]
+           << std::setw(7) << psr.boxdim[4]
+           << std::setw(7) << psr.boxdim[5]
+           << " P 1           1\n";
+
+  if (atom_indices.empty()) {
+    pdb_file << "REMARK   " << empty_message << "\n";
+    pdb_file << "END\n";
+    return;
+  }
+
+  const ChemicalDetailsKit cdk = topology.getChemicalDetailsKit();
+  int pdb_serial = 1;
+  for (int atom_idx : atom_indices) {
+    const int res_idx = topology.getResidueIndex(atom_idx);
+    const char* atom_name_ptr = reinterpret_cast<const char*>(cdk.atom_names + atom_idx);
+    const char* res_name_ptr  = reinterpret_cast<const char*>(cdk.res_names + res_idx);
+    const char2 element_pair  = zNumberToSymbol(cdk.z_numbers[atom_idx]);
+    char element_buf[3] = {element_pair.x, element_pair.y, '\0'};
+    std::string element_str(element_buf);
+    element_str.erase(element_str.find_last_not_of(' ') + 1);
+
+    pdb_file << "ATOM  "
+             << std::setw(5) << pdb_serial
+             << " "
+             << std::left << std::setw(4) << std::string(atom_name_ptr, 4) << std::right
+             << " "
+             << std::left << std::setw(3) << std::string(res_name_ptr, 3) << std::right
+             << " A"
+             << std::setw(4) << (res_idx + 1)
+             << "    "
+             << std::setw(8) << psr.xcrd[atom_idx]
+             << std::setw(8) << psr.ycrd[atom_idx]
+             << std::setw(8) << psr.zcrd[atom_idx]
+             << "  1.00  0.00          "
+             << std::right << std::setw(2) << element_str
+             << " \n";
+    pdb_serial++;
+  }
+  pdb_file << "END\n";
 }
 
 //-------------------------------------------------------------------------------------------------
@@ -493,6 +573,12 @@ int main(int argc, const char* argv[]) {
   t_nml->addKeyword("--trajectory-prefix", NamelistType::STRING, "gcmc_snapshot");
   t_nml->addHelp("--trajectory-prefix", "Prefix for trajectory files (default: gcmc_snapshot)");
 
+  t_nml->addKeyword("--final-pdb", NamelistType::STRING, "none");
+  t_nml->addHelp("--final-pdb",
+                 "Write final snapshot to the specified PDB file (use 'auto' for output-prefix + '-final.pdb')");
+  t_nml->addKeyword("--final-pdb-active-only", NamelistType::BOOLEAN, "");
+  t_nml->addHelp("--final-pdb-active-only", "When writing final PDB, include only active molecules");
+
   // Add Generalized Born implicit solvent model parameter
   t_nml->addKeyword("--gb-model", NamelistType::STRING, "none");
   t_nml->addHelp("--gb-model", "Generalized Born model: none, hct, obc, obc2, neck, neck2 (default: none)");
@@ -624,6 +710,8 @@ int main(int argc, const char* argv[]) {
   const bool save_trajectory = t_nml->getBoolValue("--save-trajectory");
   const int snapshot_interval = t_nml->getIntValue("--snapshot-interval");
   const std::string trajectory_prefix = t_nml->getStringValue("--trajectory-prefix");
+  const std::string final_pdb_option = t_nml->getStringValue("--final-pdb");
+  const bool final_pdb_active_only = t_nml->getBoolValue("--final-pdb-active-only");
 
   // Parse adaptive B protocol parameters
   const bool adaptive_b = t_nml->getBoolValue("--adaptive-b");
@@ -676,7 +764,8 @@ int main(int argc, const char* argv[]) {
                    timestep, npert, nprop, nghost, mu_ex, standard_volume,
                    overwrite, mode, box_size, freeze_fragments,
                    save_trajectory, snapshot_interval, trajectory_prefix,
-                   mc_translation, mc_rotation, mc_torsion, mc_frequency);
+                   mc_translation, mc_rotation, mc_torsion, mc_frequency,
+                   final_pdb_option, final_pdb_active_only);
     std::cout << "\nConfiguration file written successfully.\n";
     std::cout << "To use it, run: gcmc.stormm --config " << write_config_file << "\n";
     return 0;
@@ -1324,57 +1413,8 @@ int main(int argc, const char* argv[]) {
 
         #endif
 
-        if (active_atoms.empty()) {
-          // No active molecules - write empty PDB
-          std::ofstream pdb_file(snapshot_filename.str());
-          pdb_file << "REMARK   No active molecules\n";
-          pdb_file << "END\n";
-          pdb_file.close();
-        } else {
-          // Write PDB with only active atoms
-          std::ofstream pdb_file(snapshot_filename.str());
-          const PhaseSpaceReader psr = system_ps.data();
-          const ChemicalDetailsKit cdk = system_ag.getChemicalDetailsKit();
-
-          // Write box dimensions
-          pdb_file << std::fixed << std::setprecision(3);
-          pdb_file << "CRYST1"
-                   << std::setw(9) << psr.boxdim[0]
-                   << std::setw(9) << psr.boxdim[1]
-                   << std::setw(9) << psr.boxdim[2]
-                   << std::setw(7) << psr.boxdim[3]
-                   << std::setw(7) << psr.boxdim[4]
-                   << std::setw(7) << psr.boxdim[5]
-                   << " P 1           1\n";
-
-          // Write active atoms
-          int pdb_serial = 1;
-          for (int atom_idx : active_atoms) {
-            // Use getResidueIndex() API instead of res_limits array to work around
-            // bug in AtomGraph combination constructor
-            const int res_idx = system_ag.getResidueIndex(atom_idx);
-            const char* atom_name_ptr = reinterpret_cast<const char*>(cdk.atom_names + atom_idx);
-            const char* res_name_ptr = reinterpret_cast<const char*>(cdk.res_names + res_idx);
-
-            pdb_file << "ATOM  "
-                     << std::setw(5) << pdb_serial
-                     << " "
-                     << std::left << std::setw(4) << std::string(atom_name_ptr, 4) << std::right
-                     << " "
-                     << std::left << std::setw(3) << std::string(res_name_ptr, 3) << std::right
-                     << " A"
-                     << std::setw(4) << (res_idx + 1)
-                     << "    "
-                     << std::setw(8) << psr.xcrd[atom_idx]
-                     << std::setw(8) << psr.ycrd[atom_idx]
-                     << std::setw(8) << psr.zcrd[atom_idx]
-                     << "  1.00  0.00           "
-                     << std::string(atom_name_ptr, 1) << " \n";
-            pdb_serial++;
-          }
-          pdb_file << "END\n";
-          pdb_file.close();
-        }
+        writePdbSnapshot(snapshot_filename.str(), system_ag, system_ps, active_atoms,
+                         "No active molecules", true);
       }
 
       // Print progress every 100 moves or at specific milestones
@@ -1519,6 +1559,27 @@ int main(int argc, const char* argv[]) {
                    CoordinateFileKind::AMBER_INPCRD,
                    overwrite ? PrintSituation::OVERWRITE : PrintSituation::OPEN_NEW);
 
+    std::string final_pdb_written;
+    if (!final_pdb_option.empty() && final_pdb_option != "none") {
+      std::string final_pdb_path = final_pdb_option;
+      if (final_pdb_path == "auto" || final_pdb_path == "AUTO") {
+        final_pdb_path = output_prefix.empty() ? "gcmc-final.pdb" : output_prefix + "-final.pdb";
+      }
+      std::vector<int> final_atoms;
+      std::string empty_message = "No atoms selected";
+      if (final_pdb_active_only) {
+        final_atoms = sampler->getActiveAtomIndices();
+        empty_message = "No active molecules";
+      }
+      else {
+        final_atoms.resize(system_ag.getAtomCount());
+        std::iota(final_atoms.begin(), final_atoms.end(), 0);
+      }
+      writePdbSnapshot(final_pdb_path, system_ag, system_ps, final_atoms, empty_message,
+                       overwrite);
+      final_pdb_written = final_pdb_path;
+    }
+
     // Write final ghost snapshot
     sampler->writeGhostSnapshot();
 
@@ -1526,6 +1587,9 @@ int main(int argc, const char* argv[]) {
     std::cout << "  Ghost IDs:     " << ghost_file << "\n";
     std::cout << "  Log file:      " << log_file << "\n";
     std::cout << "  Final coords:  " << final_crd << "\n";
+    if (!final_pdb_written.empty()) {
+      std::cout << "  Final PDB:     " << final_pdb_written << "\n";
+    }
 
     // Print timing information
     timer.assignTime(output_tm);
