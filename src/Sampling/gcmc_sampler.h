@@ -46,6 +46,7 @@ enum class AnnealingStage {
 
 using card::Hybrid;
 using card::CoreKlManager;
+using card::HybridTargetLevel;
 using energy::CacheResource;
 using energy::CellGrid;
 using energy::EvaluateForce;
@@ -198,6 +199,7 @@ public:
   ///
   /// \return Pointer to the phase space
   PhaseSpace* getPhaseSpace() const { return phase_space_; }
+  PhaseSpace exportCurrentPhaseSpace(HybridTargetLevel tier = HybridTargetLevel::HOST) const;
 
   /// \brief Get the AtomGraph pointer (needed by MC movers)
   ///

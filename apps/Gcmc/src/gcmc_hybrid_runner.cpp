@@ -16,6 +16,7 @@
 #include <optional>
 #include <cstdlib>
 #include <cctype>
+#include <chrono>
 #include "copyright.h"
 
 #ifdef STORMM_USE_HPC
@@ -50,6 +51,8 @@ using namespace stormm::trajectory;
 using namespace stormm::chemistry;
 
 namespace {
+
+using clock = std::chrono::high_resolution_clock;
 
 GhostMoleculeMetadata buildSystemWithGhosts(const std::string &protein_prmtop,
                                             const std::string &protein_inpcrd,
@@ -898,13 +901,27 @@ void writePdbSnapshot(const std::filesystem::path& file_path,
   const ChemicalDetailsKit cdk = topology.getChemicalDetailsKit();
   int serial = 1;
   for (const int atom_idx : atom_indices) {
+    const double x = psr.xcrd[atom_idx];
+    const double y = psr.ycrd[atom_idx];
+    const double z = psr.zcrd[atom_idx];
+    if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)) {
+      continue;
+    }
     const int res_idx = topology.getResidueIndex(atom_idx);
     const char* atom_name_ptr = reinterpret_cast<const char*>(cdk.atom_names + atom_idx);
     const char* res_name_ptr  = reinterpret_cast<const char*>(cdk.res_names + res_idx);
     const char2 element_pair  = zNumberToSymbol(cdk.z_numbers[atom_idx]);
     char element_buf[3] = {element_pair.x, element_pair.y, '\0'};
     std::string element = element_buf;
-    element.erase(element.find_last_not_of(' ') + 1);
+    if (!element.empty()) {
+      const size_t last_non_space = element.find_last_not_of(' ');
+      if (last_non_space != std::string::npos) {
+        element.erase(last_non_space + 1);
+      }
+      else {
+        element.clear();
+      }
+    }
 
     pdb_file << "ATOM  "
              << std::setw(5) << serial
@@ -915,13 +932,16 @@ void writePdbSnapshot(const std::filesystem::path& file_path,
              << " A"
              << std::setw(4) << (res_idx + 1)
              << "    "
-             << std::setw(8) << psr.xcrd[atom_idx]
-             << std::setw(8) << psr.ycrd[atom_idx]
-             << std::setw(8) << psr.zcrd[atom_idx]
+             << std::setw(8) << x
+             << std::setw(8) << y
+             << std::setw(8) << z
              << "  1.00  0.00          "
              << std::right << std::setw(2) << element
              << " \n";
     serial++;
+  }
+  if (serial == 1) {
+    pdb_file << "REMARK   " << empty_message << "\n";
   }
   pdb_file << "END\n";
 }
@@ -1034,8 +1054,13 @@ int main(int argc, const char* argv[]) {
   const std::string output_dir_cli = t_nml->getStringValue("--output-dir");
   const std::string final_pdb_option = t_nml->getStringValue("--final-pdb");
   const bool final_pdb_active_only = t_nml->getBoolValue("--final-pdb-active-only");
-  const std::string constant_b_pdb_prefix_cli =
-      t_nml->getStringValue("--constant-b-pdb-prefix");
+
+  std::string constant_b_pdb_prefix_cli;
+  const InputStatus constant_b_status =
+      t_nml->getKeywordStatus("--constant-b-pdb-prefix");
+  if (constant_b_status != InputStatus::MISSING) {
+    constant_b_pdb_prefix_cli = t_nml->getStringValue("--constant-b-pdb-prefix");
+  }
 
   verifyInputFile(protein_prmtop, "Protein topology");
   verifyInputFile(protein_inpcrd, "Protein coordinate");
@@ -1046,7 +1071,21 @@ int main(int argc, const char* argv[]) {
     output_prefix = "gcmc_hybrid_output";
   }
 
-  const int n_moves = std::max(t_nml->getIntValue("--moves"), t_nml->getIntValue("-n"));
+  const bool moves_user = (t_nml->getKeywordStatus("--moves") == InputStatus::USER_SPECIFIED);
+  const bool n_user = (t_nml->getKeywordStatus("-n") == InputStatus::USER_SPECIFIED);
+  int n_moves = 0;
+  if (moves_user && !n_user) {
+    n_moves = t_nml->getIntValue("--moves");
+  }
+  else if (!moves_user && n_user) {
+    n_moves = t_nml->getIntValue("-n");
+  }
+  else if (moves_user && n_user) {
+    n_moves = t_nml->getIntValue("--moves");
+  }
+  else {
+    n_moves = t_nml->getIntValue("--moves");
+  }
   const double temperature = t_nml->getRealValue("--temp");
   const int n_ghosts = t_nml->getIntValue("--nghost");
   const double timestep = t_nml->getRealValue("--timestep");
@@ -1249,6 +1288,9 @@ int main(int argc, const char* argv[]) {
     const int report_interval = std::max(50, n_moves / 10);
     int prev_report_moves = 0;
     int prev_report_accepts = 0;
+    double total_gcmc_time = 0.0;
+    double total_mc_time = 0.0;
+    double total_md_time = 0.0;
 
     for (int cycle = 0; cycle < n_moves; cycle++) {
 #ifdef STORMM_USE_HPC
@@ -1256,18 +1298,23 @@ int main(int argc, const char* argv[]) {
       size_t total_bytes = 0UL;
       cudaMemGetInfo(&free_bytes_before, &total_bytes);
 #endif
+      const auto gcmc_start = clock::now();
       const bool accepted = sampler.runGCMCCycle();
+      total_gcmc_time +=
+          std::chrono::duration<double>(clock::now() - gcmc_start).count();
 
+      const auto mc_start = clock::now();
       for (int mc_attempt = 0; mc_attempt < mc_frequency; mc_attempt++) {
         sampler.attemptMCMovesOnAllMolecules();
       }
+      total_mc_time += std::chrono::duration<double>(clock::now() - mc_start).count();
 
+      const auto md_start = clock::now();
       sampler.propagateSystem(md_steps);
+      total_md_time += std::chrono::duration<double>(clock::now() - md_start).count();
 
       if (!use_adaptive_b && have_constant_b_prefix && cycle < 100) {
-#ifdef STORMM_USE_HPC
-        phase_space.download();
-#endif
+        const PhaseSpace snapshot_ps = sampler.exportCurrentPhaseSpace();
         std::ostringstream pdb_name;
         pdb_name << constant_b_prefix_stem << "_" << std::setw(3) << std::setfill('0')
                  << (cycle + 1) << ".pdb";
@@ -1276,7 +1323,7 @@ int main(int argc, const char* argv[]) {
             parent_dir.empty() ? std::filesystem::path(pdb_name.str())
                                : parent_dir / pdb_name.str();
         const std::vector<int> debug_atoms = sampler.getActiveAtomIndices();
-        writePdbSnapshot(snapshot_path, combined_topology, phase_space, debug_atoms,
+        writePdbSnapshot(snapshot_path, combined_topology, snapshot_ps, debug_atoms,
                          "No active molecules");
       }
 
@@ -1400,22 +1447,33 @@ int main(int argc, const char* argv[]) {
       std::cout << "  Constant B value:   " << constant_b.str() << "\n";
     }
 
-#ifdef STORMM_USE_HPC
-    phase_space.download();
-#endif
+    const double timing_denom = (n_moves > 0) ? static_cast<double>(n_moves) : 1.0;
+    std::cout << "  Avg timing per cycle (s): GCMC="
+              << (total_gcmc_time / timing_denom)
+              << "  MC=" << (total_mc_time / timing_denom)
+              << "  MD=" << (total_md_time / timing_denom) << "\n";
+
     if (final_pdb_path.has_value()) {
+      const PhaseSpace final_ps = sampler.exportCurrentPhaseSpace();
       std::vector<int> final_atoms;
       std::string empty_message = "No atoms selected";
       if (final_pdb_active_only) {
-        final_atoms = sampler.getActiveAtomIndices();
-        empty_message = "No active molecules";
+        final_atoms.reserve(static_cast<size_t>(protein_atom_count));
+        for (int i = 0; i < protein_atom_count; i++) {
+          final_atoms.push_back(i);
+        }
+        const std::vector<int> active_atoms = sampler.getActiveAtomIndices();
+        final_atoms.insert(final_atoms.end(), active_atoms.begin(), active_atoms.end());
+        empty_message = active_atoms.empty() ?
+                        "Protein only (no active fragments)" :
+                        "Protein plus active fragments";
       }
       else {
         const int natoms = combined_topology.getAtomCount();
         final_atoms.resize(natoms);
         std::iota(final_atoms.begin(), final_atoms.end(), 0);
       }
-      writePdbSnapshot(*final_pdb_path, combined_topology, phase_space,
+      writePdbSnapshot(*final_pdb_path, combined_topology, final_ps,
                        final_atoms, empty_message);
       std::cout << "Final PDB snapshot written to " << final_pdb_path->string() << "\n";
     }

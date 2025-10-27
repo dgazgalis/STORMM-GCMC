@@ -1,4 +1,5 @@
 // -*-c++-*-
+#include <array>
 #include "copyright.h"
 #include "Constants/behavior.h"
 #include "Constants/hpc_bounds.h"
@@ -49,6 +50,140 @@ using synthesis::quarter_valence_work_unit_atoms;
 using synthesis::minimum_valence_work_unit_atoms;
 using parse::CaseSensitivity;
 using parse::strcmpCased;
+
+namespace {
+
+struct NonbondedKernelNameEntry {
+  constants::PrecisionModel precision;
+  EvaluateForce eval_force;
+  EvaluateEnergy eval_energy;
+  AccumulationMethod accumulation;
+  const char* tile_group_prefix;
+  const char* supertile_prefix;
+};
+
+/// Each mapping below associates a particular non-bonded kernel configuration with the mangled
+/// symbol prefix exported by the CUDA compilation units.  Tile-group prefixes mirror the existing
+/// ktg* naming convention, while supertile prefixes reserve kst*/kss* identifiers for the new
+/// 256x256 atom kernels.  Supertile kernels iterate over implicit 16x16 tile neighborhoods using
+/// base indices and a stride rather than explicit tile lists; launch wrappers will provide the
+/// additional (supertile_i_start, supertile_j_start, stride) arguments when these prefixes are
+/// dispatched.
+constexpr std::array<NonbondedKernelNameEntry, 12> nonbonded_kernel_name_table = {{
+    { constants::PrecisionModel::DOUBLE, EvaluateForce::NO,  EvaluateEnergy::YES,
+      AccumulationMethod::SPLIT, "ktgd", "kstf" },
+    { constants::PrecisionModel::DOUBLE, EvaluateForce::NO,  EvaluateEnergy::YES,
+      AccumulationMethod::WHOLE, "ktgd", "kstf" },
+    { constants::PrecisionModel::DOUBLE, EvaluateForce::YES, EvaluateEnergy::NO,
+      AccumulationMethod::SPLIT, "ktgds", "ksts" },
+    { constants::PrecisionModel::DOUBLE, EvaluateForce::YES, EvaluateEnergy::NO,
+      AccumulationMethod::WHOLE, "ktgds", "kstw" },
+    { constants::PrecisionModel::DOUBLE, EvaluateForce::YES, EvaluateEnergy::YES,
+      AccumulationMethod::SPLIT, "ktgds", "ksts" },
+    { constants::PrecisionModel::DOUBLE, EvaluateForce::YES, EvaluateEnergy::YES,
+      AccumulationMethod::WHOLE, "ktgds", "kstw" },
+    { constants::PrecisionModel::SINGLE, EvaluateForce::NO,  EvaluateEnergy::YES,
+      AccumulationMethod::SPLIT, "ktgf", "ksff" },
+    { constants::PrecisionModel::SINGLE, EvaluateForce::NO,  EvaluateEnergy::YES,
+      AccumulationMethod::WHOLE, "ktgf", "ksff" },
+    { constants::PrecisionModel::SINGLE, EvaluateForce::YES, EvaluateEnergy::NO,
+      AccumulationMethod::SPLIT, "ktgfs", "kssf" },
+    { constants::PrecisionModel::SINGLE, EvaluateForce::YES, EvaluateEnergy::NO,
+      AccumulationMethod::WHOLE, "ktgfs", "kswf" },
+    { constants::PrecisionModel::SINGLE, EvaluateForce::YES, EvaluateEnergy::YES,
+      AccumulationMethod::SPLIT, "ktgfs", "kssf" },
+    { constants::PrecisionModel::SINGLE, EvaluateForce::YES, EvaluateEnergy::YES,
+      AccumulationMethod::WHOLE, "ktgfs", "kswf" }
+}};
+
+const NonbondedKernelNameEntry& getNonbondedKernelNameEntry(
+    const constants::PrecisionModel precision, const EvaluateForce eval_force,
+    const EvaluateEnergy eval_energy, AccumulationMethod accumulation) {
+  if (accumulation == AccumulationMethod::AUTOMATIC) {
+    accumulation = AccumulationMethod::SPLIT;
+  }
+  for (const NonbondedKernelNameEntry& entry : nonbonded_kernel_name_table) {
+    if (entry.precision == precision && entry.eval_force == eval_force &&
+        entry.eval_energy == eval_energy && entry.accumulation == accumulation) {
+      return entry;
+    }
+  }
+  rtErr("No kernel naming rule could be located for precision " +
+        getEnumerationName(precision) + ", force " + getEnumerationName(eval_force) + ", energy " +
+        getEnumerationName(eval_energy) + ", accumulation " + getEnumerationName(accumulation) +
+        ".", "CoreKlManager");
+  return nonbonded_kernel_name_table.front();
+}
+
+const char* implicitSolventKernelLabel(const ImplicitSolventModel igb) {
+  switch (igb) {
+  case ImplicitSolventModel::NONE:
+    return "Vacuum";
+  case ImplicitSolventModel::HCT_GB:
+  case ImplicitSolventModel::OBC_GB:
+  case ImplicitSolventModel::OBC_GB_II:
+    return "GB";
+  case ImplicitSolventModel::NECK_GB:
+  case ImplicitSolventModel::NECK_GB_II:
+    return "GBNeck";
+  }
+  rtErr("Implicit solvent model " + getEnumerationName(igb) +
+        " is not supported for non-bonded kernel cataloguing.",
+        "CoreKlManager");
+  return "Vacuum";
+}
+
+const char* operationSuffix(const EvaluateForce eval_force, const EvaluateEnergy eval_energy) {
+  if (eval_force == EvaluateForce::YES && eval_energy == EvaluateEnergy::YES) {
+    return "ForceEnergy";
+  }
+  if (eval_force == EvaluateForce::YES && eval_energy == EvaluateEnergy::NO) {
+    return "Force";
+  }
+  if (eval_force == EvaluateForce::NO && eval_energy == EvaluateEnergy::YES) {
+    return "Energy";
+  }
+  rtErr("A non-bonded kernel must calculate either forces, energies, or both.", "CoreKlManager");
+  return "Energy";
+}
+
+std::string assembleNonbondedKernelSymbolName(const constants::PrecisionModel precision,
+                                              const NbwuKind kind,
+                                              const EvaluateForce eval_force,
+                                              const EvaluateEnergy eval_energy,
+                                              AccumulationMethod accumulation,
+                                              const ImplicitSolventModel igb,
+                                              const ClashResponse collision) {
+  const NonbondedKernelNameEntry& entry =
+      getNonbondedKernelNameEntry(precision, eval_force, eval_energy, accumulation);
+  const char* prefix = nullptr;
+  switch (kind) {
+  case NbwuKind::TILE_GROUPS:
+    prefix = entry.tile_group_prefix;
+    break;
+  case NbwuKind::SUPERTILES:
+    prefix = entry.supertile_prefix;
+    break;
+  default:
+    break;
+  }
+  if (prefix == nullptr || prefix[0] == '\0') {
+    rtErr("No kernel symbol prefix has been assigned for " + getEnumerationName(kind) +
+          " work units with precision " + getEnumerationName(precision) + ", force " +
+          getEnumerationName(eval_force) + ", energy " + getEnumerationName(eval_energy) +
+          ", accumulation " + getEnumerationName(accumulation) + ".", "CoreKlManager");
+  }
+
+  std::string name(prefix);
+  name += implicitSolventKernelLabel(igb);
+  name += operationSuffix(eval_force, eval_energy);
+  if (collision == ClashResponse::FORGIVE) {
+    name += "NonClash";
+  }
+  return name;
+}
+
+} // namespace
 
 //-------------------------------------------------------------------------------------------------
 CoreKlManager::CoreKlManager(const GpuDetails &gpu_in, const AtomGraphSynthesis *poly_ag) :
@@ -141,35 +276,75 @@ CoreKlManager::CoreKlManager(const GpuDetails &gpu_in, const AtomGraphSynthesis 
         catalogNonbondedKernel(PrecisionModel::DOUBLE, NbwuKind::TILE_GROUPS, EvaluateForce::NO,
                                EvaluateEnergy::YES, AccumulationMethod::SPLIT, is_models[j],
                                clash_policy[i],
-                               "ktgd" + is_model_names[j] + "Energy" + clash_ext[i]);
+                               assembleNonbondedKernelSymbolName(PrecisionModel::DOUBLE,
+                                                                  NbwuKind::TILE_GROUPS,
+                                                                  EvaluateForce::NO,
+                                                                  EvaluateEnergy::YES,
+                                                                  AccumulationMethod::SPLIT,
+                                                                  is_models[j], clash_policy[i]));
         catalogNonbondedKernel(PrecisionModel::DOUBLE, NbwuKind::TILE_GROUPS, EvaluateForce::YES,
                                EvaluateEnergy::NO, AccumulationMethod::SPLIT, is_models[j],
                                clash_policy[i],
-                               "ktgds" + is_model_names[j] + "Force" + clash_ext[i]);
+                               assembleNonbondedKernelSymbolName(PrecisionModel::DOUBLE,
+                                                                  NbwuKind::TILE_GROUPS,
+                                                                  EvaluateForce::YES,
+                                                                  EvaluateEnergy::NO,
+                                                                  AccumulationMethod::SPLIT,
+                                                                  is_models[j], clash_policy[i]));
         catalogNonbondedKernel(PrecisionModel::DOUBLE, NbwuKind::TILE_GROUPS, EvaluateForce::YES,
                                EvaluateEnergy::YES, AccumulationMethod::SPLIT, is_models[j],
                                clash_policy[i],
-                               "ktgds" + is_model_names[j] + "ForceEnergy" + clash_ext[i]);
+                               assembleNonbondedKernelSymbolName(PrecisionModel::DOUBLE,
+                                                                  NbwuKind::TILE_GROUPS,
+                                                                  EvaluateForce::YES,
+                                                                  EvaluateEnergy::YES,
+                                                                  AccumulationMethod::SPLIT,
+                                                                  is_models[j], clash_policy[i]));
         catalogNonbondedKernel(PrecisionModel::SINGLE, NbwuKind::TILE_GROUPS, EvaluateForce::NO,
                                EvaluateEnergy::YES, AccumulationMethod::SPLIT, is_models[j],
                                clash_policy[i],
-                               "ktgf" + is_model_names[j] + "Energy" + clash_ext[i]);
+                               assembleNonbondedKernelSymbolName(PrecisionModel::SINGLE,
+                                                                  NbwuKind::TILE_GROUPS,
+                                                                  EvaluateForce::NO,
+                                                                  EvaluateEnergy::YES,
+                                                                  AccumulationMethod::SPLIT,
+                                                                  is_models[j], clash_policy[i]));
         catalogNonbondedKernel(PrecisionModel::SINGLE, NbwuKind::TILE_GROUPS, EvaluateForce::YES,
                                EvaluateEnergy::NO, AccumulationMethod::SPLIT, is_models[j],
                                clash_policy[i],
-                               "ktgfs" + is_model_names[j] + "Force" + clash_ext[i]);
+                               assembleNonbondedKernelSymbolName(PrecisionModel::SINGLE,
+                                                                  NbwuKind::TILE_GROUPS,
+                                                                  EvaluateForce::YES,
+                                                                  EvaluateEnergy::NO,
+                                                                  AccumulationMethod::SPLIT,
+                                                                  is_models[j], clash_policy[i]));
         catalogNonbondedKernel(PrecisionModel::SINGLE, NbwuKind::TILE_GROUPS, EvaluateForce::YES,
                                EvaluateEnergy::NO, AccumulationMethod::WHOLE, is_models[j],
                                clash_policy[i],
-                               "ktgfs" + is_model_names[j] + "Force" + clash_ext[i]);
+                               assembleNonbondedKernelSymbolName(PrecisionModel::SINGLE,
+                                                                  NbwuKind::TILE_GROUPS,
+                                                                  EvaluateForce::YES,
+                                                                  EvaluateEnergy::NO,
+                                                                  AccumulationMethod::WHOLE,
+                                                                  is_models[j], clash_policy[i]));
         catalogNonbondedKernel(PrecisionModel::SINGLE, NbwuKind::TILE_GROUPS, EvaluateForce::YES,
                                EvaluateEnergy::YES, AccumulationMethod::SPLIT, is_models[j],
                                clash_policy[i],
-                               "ktgfs" + is_model_names[j] + "ForceEnergy" + clash_ext[i]);
+                               assembleNonbondedKernelSymbolName(PrecisionModel::SINGLE,
+                                                                  NbwuKind::TILE_GROUPS,
+                                                                  EvaluateForce::YES,
+                                                                  EvaluateEnergy::YES,
+                                                                  AccumulationMethod::SPLIT,
+                                                                  is_models[j], clash_policy[i]));
         catalogNonbondedKernel(PrecisionModel::SINGLE, NbwuKind::TILE_GROUPS, EvaluateForce::YES,
                                EvaluateEnergy::YES, AccumulationMethod::WHOLE, is_models[j],
                                clash_policy[i],
-                               "ktgfs" + is_model_names[j] + "ForceEnergy" + clash_ext[i]);
+                               assembleNonbondedKernelSymbolName(PrecisionModel::SINGLE,
+                                                                  NbwuKind::TILE_GROUPS,
+                                                                  EvaluateForce::YES,
+                                                                  EvaluateEnergy::YES,
+                                                                  AccumulationMethod::WHOLE,
+                                                                  is_models[j], clash_policy[i]));
 
         // Generalized Born radii and radial derivative kernel entries
         if (is_models[j] != ImplicitSolventModel::NONE && clash_policy[i] == ClashResponse::NONE) {
@@ -201,35 +376,75 @@ CoreKlManager::CoreKlManager(const GpuDetails &gpu_in, const AtomGraphSynthesis 
         catalogNonbondedKernel(PrecisionModel::DOUBLE, NbwuKind::TILE_GROUPS, EvaluateForce::NO,
                                EvaluateEnergy::YES, AccumulationMethod::SPLIT, is_models[j],
                                clash_policy[i],
-                               "ktgd" + is_model_names[j] + "Energy" + clash_ext[i]);
+                               assembleNonbondedKernelSymbolName(PrecisionModel::DOUBLE,
+                                                                  NbwuKind::TILE_GROUPS,
+                                                                  EvaluateForce::NO,
+                                                                  EvaluateEnergy::YES,
+                                                                  AccumulationMethod::SPLIT,
+                                                                  is_models[j], clash_policy[i]));
         catalogNonbondedKernel(PrecisionModel::DOUBLE, NbwuKind::TILE_GROUPS, EvaluateForce::YES,
                                EvaluateEnergy::NO, AccumulationMethod::SPLIT, is_models[j],
                                clash_policy[i],
-                               "ktgds" + is_model_names[j] + "Force" + clash_ext[i]);
+                               assembleNonbondedKernelSymbolName(PrecisionModel::DOUBLE,
+                                                                  NbwuKind::TILE_GROUPS,
+                                                                  EvaluateForce::YES,
+                                                                  EvaluateEnergy::NO,
+                                                                  AccumulationMethod::SPLIT,
+                                                                  is_models[j], clash_policy[i]));
         catalogNonbondedKernel(PrecisionModel::DOUBLE, NbwuKind::TILE_GROUPS, EvaluateForce::YES,
                                EvaluateEnergy::YES, AccumulationMethod::SPLIT, is_models[j],
                                clash_policy[i],
-                               "ktgds" + is_model_names[j] + "ForceEnergy" + clash_ext[i]);
+                               assembleNonbondedKernelSymbolName(PrecisionModel::DOUBLE,
+                                                                  NbwuKind::TILE_GROUPS,
+                                                                  EvaluateForce::YES,
+                                                                  EvaluateEnergy::YES,
+                                                                  AccumulationMethod::SPLIT,
+                                                                  is_models[j], clash_policy[i]));
         catalogNonbondedKernel(PrecisionModel::SINGLE, NbwuKind::TILE_GROUPS, EvaluateForce::NO,
                                EvaluateEnergy::YES, AccumulationMethod::SPLIT, is_models[j],
                                clash_policy[i],
-                               "ktgf" + is_model_names[j] + "Energy" + clash_ext[i]);
+                               assembleNonbondedKernelSymbolName(PrecisionModel::SINGLE,
+                                                                  NbwuKind::TILE_GROUPS,
+                                                                  EvaluateForce::NO,
+                                                                  EvaluateEnergy::YES,
+                                                                  AccumulationMethod::SPLIT,
+                                                                  is_models[j], clash_policy[i]));
         catalogNonbondedKernel(PrecisionModel::SINGLE, NbwuKind::TILE_GROUPS, EvaluateForce::YES,
                                EvaluateEnergy::NO, AccumulationMethod::SPLIT, is_models[j],
                                clash_policy[i],
-                               "ktgfs" + is_model_names[j] + "Force" + clash_ext[i]);
+                               assembleNonbondedKernelSymbolName(PrecisionModel::SINGLE,
+                                                                  NbwuKind::TILE_GROUPS,
+                                                                  EvaluateForce::YES,
+                                                                  EvaluateEnergy::NO,
+                                                                  AccumulationMethod::SPLIT,
+                                                                  is_models[j], clash_policy[i]));
         catalogNonbondedKernel(PrecisionModel::SINGLE, NbwuKind::TILE_GROUPS, EvaluateForce::YES,
                                EvaluateEnergy::NO, AccumulationMethod::WHOLE, is_models[j],
                                clash_policy[i],
-                               "ktgfs" + is_model_names[j] + "Force" + clash_ext[i]);
+                               assembleNonbondedKernelSymbolName(PrecisionModel::SINGLE,
+                                                                  NbwuKind::TILE_GROUPS,
+                                                                  EvaluateForce::YES,
+                                                                  EvaluateEnergy::NO,
+                                                                  AccumulationMethod::WHOLE,
+                                                                  is_models[j], clash_policy[i]));
         catalogNonbondedKernel(PrecisionModel::SINGLE, NbwuKind::TILE_GROUPS, EvaluateForce::YES,
                                EvaluateEnergy::YES, AccumulationMethod::SPLIT, is_models[j],
                                clash_policy[i],
-                               "ktgfs" + is_model_names[j] + "ForceEnergy" + clash_ext[i]);
+                               assembleNonbondedKernelSymbolName(PrecisionModel::SINGLE,
+                                                                  NbwuKind::TILE_GROUPS,
+                                                                  EvaluateForce::YES,
+                                                                  EvaluateEnergy::YES,
+                                                                  AccumulationMethod::SPLIT,
+                                                                  is_models[j], clash_policy[i]));
         catalogNonbondedKernel(PrecisionModel::SINGLE, NbwuKind::TILE_GROUPS, EvaluateForce::YES,
                                EvaluateEnergy::YES, AccumulationMethod::WHOLE, is_models[j],
                                clash_policy[i],
-                               "ktgfs" + is_model_names[j] + "ForceEnergy" + clash_ext[i]);
+                               assembleNonbondedKernelSymbolName(PrecisionModel::SINGLE,
+                                                                  NbwuKind::TILE_GROUPS,
+                                                                  EvaluateForce::YES,
+                                                                  EvaluateEnergy::YES,
+                                                                  AccumulationMethod::WHOLE,
+                                                                  is_models[j], clash_policy[i]));
         break;
       }
     }

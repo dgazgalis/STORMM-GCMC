@@ -1785,6 +1785,18 @@ int GCMCSampler::getTotalMoleculeCount() const {
 }
 
 //-------------------------------------------------------------------------------------------------
+PhaseSpace GCMCSampler::exportCurrentPhaseSpace(const HybridTargetLevel tier) const {
+#ifdef STORMM_USE_CUDA
+  if (ps_synthesis_ != nullptr) {
+    return ps_synthesis_->exportSystem(0, tier);
+  }
+#else
+  (void)tier;
+#endif
+  return *phase_space_;
+}
+
+//-------------------------------------------------------------------------------------------------
 const GCMCStatistics& GCMCSampler::getStatistics() const {
   return stats_;
 }

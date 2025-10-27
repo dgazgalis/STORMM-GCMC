@@ -690,7 +690,21 @@ int main(int argc, const char* argv[]) {
   const std::string output_prefix = t_nml->getStringValue("-o");
 
   // GCMC parameters
-  const int n_moves = std::max(t_nml->getIntValue("-n"), t_nml->getIntValue("--moves"));
+  const bool n_user = (t_nml->getKeywordStatus("-n") == InputStatus::USER_SPECIFIED);
+  const bool moves_user = (t_nml->getKeywordStatus("--moves") == InputStatus::USER_SPECIFIED);
+  int n_moves = 0;
+  if (n_user && !moves_user) {
+    n_moves = t_nml->getIntValue("-n");
+  }
+  else if (!n_user && moves_user) {
+    n_moves = t_nml->getIntValue("--moves");
+  }
+  else if (n_user && moves_user) {
+    n_moves = t_nml->getIntValue("--moves");
+  }
+  else {
+    n_moves = t_nml->getIntValue("-n");
+  }
   const double bvalue = std::max(t_nml->getRealValue("-b"), t_nml->getRealValue("--bvalue"));
   const double sphere_radius = t_nml->getRealValue("--sphere-radius");
   const std::string ref_atoms_str = t_nml->getStringValue("--ref-atoms");
