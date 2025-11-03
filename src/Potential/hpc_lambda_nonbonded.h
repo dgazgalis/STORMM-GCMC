@@ -16,6 +16,7 @@ namespace card {
 namespace energy {
   class CacheResource;
   class ScoreCard;
+  struct LambdaNeighborListReader;
 }
 namespace mm {
   class MolecularMechanicsControls;
@@ -99,7 +100,11 @@ void launchLambdaScaledNonbonded(
     llint* yfrc = nullptr,
     llint* zfrc = nullptr,
     synthesis::ImplicitSolventWorkspace* gb_workspace = nullptr,
-    topology::ImplicitSolventModel gb_model = topology::ImplicitSolventModel::NONE);
+    topology::ImplicitSolventModel gb_model = topology::ImplicitSolventModel::NONE,
+    const LambdaNeighborListReader* neighbor_list = nullptr,
+    const int* fragment_indices = nullptr,
+    int n_fragment = 0,
+    bool profile_timing = false);
 
 /// \brief GPU-accelerated lambda-scaled nonbonded energy evaluation with on-device reduction.
 ///
@@ -167,7 +172,11 @@ void launchLambdaScaledNonbondedWithReduction(
     llint* yfrc = nullptr,
     llint* zfrc = nullptr,
     synthesis::ImplicitSolventWorkspace* gb_workspace = nullptr,
-    topology::ImplicitSolventModel gb_model = topology::ImplicitSolventModel::NONE);
+    topology::ImplicitSolventModel gb_model = topology::ImplicitSolventModel::NONE,
+    const LambdaNeighborListReader* neighbor_list = nullptr,
+    const int* fragment_indices = nullptr,
+    int n_fragment = 0,
+    bool profile_timing = false);
 
 /// \brief GPU kernel to accumulate NCMC work delta on device.
 ///
@@ -325,6 +334,51 @@ void launchLambdaNonbonded(
     EvaluateForce eval_force,
     EvaluateEnergy eval_energy,
     const card::CoreKlManager& launcher);
+
+/// \brief Lambda nonbonded energy evaluation with GPU-side reduction to scalar totals
+///
+/// This function wraps launchLambdaNonbonded and adds a GPU reduction step that extracts
+/// scalar energy totals from the ScoreCard. This eliminates the 4.36 MB ScoreCard download,
+/// replacing it with a 16-byte transfer (2 doubles). Uses the same fast tile-based kernels
+/// as launchLambdaNonbonded but optimizes memory transfer.
+///
+/// \param lambda_vdw           Per-atom VDW lambda values (device array)
+/// \param lambda_ele           Per-atom electrostatic lambda values (device array)
+/// \param coupled_indices      Indices of coupled atoms (device array)
+/// \param n_coupled            Number of coupled atoms
+/// \param prec                 Precision model (DOUBLE or SINGLE)
+/// \param poly_ag              Atom graph synthesis
+/// \param poly_se              Static exclusion mask synthesis
+/// \param mmctrl               Molecular mechanics controls
+/// \param poly_ps              Phase space synthesis
+/// \param heat_bath            Thermostat (can be nullptr)
+/// \param sc                   Score card for energy accumulation
+/// \param tb_space             Cache resource for tile-based kernels
+/// \param ism_space            Implicit solvent workspace (nullptr if GB disabled)
+/// \param eval_force           Whether to evaluate forces
+/// \param eval_energy          Whether to evaluate energy
+/// \param launcher             Kernel launch manager
+/// \param total_elec_out       Device pointer for scalar total electrostatic energy
+/// \param total_vdw_out        Device pointer for scalar total VDW energy
+void launchLambdaNonbondedWithReduction(
+    const double* lambda_vdw,
+    const double* lambda_ele,
+    const int* coupled_indices,
+    int n_coupled,
+    constants::PrecisionModel prec,
+    const synthesis::AtomGraphSynthesis& poly_ag,
+    const synthesis::StaticExclusionMaskSynthesis& poly_se,
+    mm::MolecularMechanicsControls* mmctrl,
+    synthesis::PhaseSpaceSynthesis* poly_ps,
+    trajectory::Thermostat* heat_bath,
+    ScoreCard* sc,
+    energy::CacheResource* tb_space,
+    synthesis::ImplicitSolventWorkspace* ism_space,
+    EvaluateForce eval_force,
+    EvaluateEnergy eval_energy,
+    const card::CoreKlManager& launcher,
+    double* total_elec_out,
+    double* total_vdw_out);
 
 } // namespace energy
 } // namespace stormm

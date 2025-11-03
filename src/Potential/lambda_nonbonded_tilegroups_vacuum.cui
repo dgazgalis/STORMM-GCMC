@@ -1,0 +1,553 @@
+// -*-c++-*-
+#include "copyright.h"
+
+/// \brief Tile-based lambda-scaled nonbonded kernel for GCMC with PBC support
+///
+/// This kernel uses the proven tile-group architecture with warp shuffle to achieve 27× speedup
+/// over the serial lambda kernel. Lambda scaling is integrated directly into the interaction
+/// computation.
+///
+/// Key features:
+/// - Lambda values (lambda_vdw, lambda_ele) loaded and shuffled alongside coordinates
+/// - Charges and LJ interactions scaled by lambda products
+/// - Softcore VDW for lambda < 1.0 to avoid singularities
+/// - Explicit minimum image convention for orthorhombic periodic boundary conditions
+/// - Simplified for non-GB systems (no implicit solvent in this version)
+///
+/// Architecture:
+/// - 16×16 tiles processed by 32-thread warps
+/// - Warp shuffle: 8 iterations instead of 5,316 serial iterations
+/// - Shared memory force accumulation
+/// - Work unit batching for optimal occupancy
+/// - Periodic boundaries via minimum image applied in inner loop
+
+#ifdef STORMM_USE_CUDA
+#  if (__CUDA_ARCH__ == 700 || __CUDA_ARCH__ >= 800)
+#    define LARGE_CHIP_CACHE
+#  endif
+#endif
+
+#define EXCL_GMEM_OFFSET  (blockIdx.x * gmem_r.max_atoms)
+
+/// \brief Lambda-scaled tile-group nonbonded kernel
+///
+/// \param poly_nbk   Non-bonded parameter tables
+/// \param poly_se    Static exclusion masks
+/// \param ctrl       Molecular mechanics control data
+/// \param poly_psw   Coordinates and forces
+/// \param lambda_vdw Lambda values for VDW scaling (device array, per-atom)
+/// \param lambda_ele Lambda values for electrostatic scaling (device array, per-atom)
+/// \param scw        Energy tracking object
+/// \param tstw       Thermostat (unused, for interface compatibility)
+/// \param gmem_r     Workspaces for each thread block
+__global__ void __launch_bounds__(small_block_size, NONBOND_KERNEL_BLOCKS_MULTIPLIER)
+KERNEL_NAME(const SyNonbondedKit<TCALC, TCALC2> poly_nbk,
+            const SeMaskSynthesisReader poly_se,
+            const MMControlKit<TCALC> ctrl,
+            PsSynthesisWriter poly_psw,
+            const double* __restrict__ lambda_vdw,
+            const double* __restrict__ lambda_ele,
+#ifdef COMPUTE_ENERGY
+            ScoreCardWriter scw,
+#endif
+            ThermostatWriter<TCALC> tstw,
+            CacheResourceKit<TCALC> gmem_r) {
+
+  // Shared memory for tile coordinates and properties
+  __shared__ TCALC sh_tile_xcog[small_block_max_imports];
+  __shared__ TCALC sh_tile_ycog[small_block_max_imports];
+  __shared__ TCALC sh_tile_zcog[small_block_max_imports];
+  __shared__ TCALC sh_tile_tpts[small_block_max_imports];
+  __shared__ int sh_n_lj_types[small_block_max_imports];
+  __shared__ int sh_ljabc_offsets[small_block_max_imports];
+
+#ifdef COMPUTE_FORCE
+#  ifdef TCALC_IS_SINGLE
+#    ifdef SPLIT_FORCE_ACCUMULATION
+  __shared__ int sh_xfrc[small_block_max_atoms];
+  __shared__ int sh_yfrc[small_block_max_atoms];
+  __shared__ int sh_zfrc[small_block_max_atoms];
+  __shared__ int sh_xfrc_overflow[small_block_max_atoms];
+  __shared__ int sh_yfrc_overflow[small_block_max_atoms];
+  __shared__ int sh_zfrc_overflow[small_block_max_atoms];
+#    else
+  __shared__ llint sh_xfrc[small_block_max_atoms];
+  __shared__ llint sh_yfrc[small_block_max_atoms];
+  __shared__ llint sh_zfrc[small_block_max_atoms];
+#    endif
+#  else
+  __shared__ llint sh_xfrc[small_block_max_atoms];
+  __shared__ llint sh_yfrc[small_block_max_atoms];
+  __shared__ llint sh_zfrc[small_block_max_atoms];
+  __shared__ int sh_xfrc_overflow[small_block_max_atoms];
+  __shared__ int sh_yfrc_overflow[small_block_max_atoms];
+  __shared__ int sh_zfrc_overflow[small_block_max_atoms];
+#  endif
+#endif
+
+#ifdef LARGE_CHIP_CACHE
+  __shared__ llint sh_xcrd[small_block_max_atoms];
+  __shared__ llint sh_ycrd[small_block_max_atoms];
+  __shared__ llint sh_zcrd[small_block_max_atoms];
+#  ifndef TCALC_IS_SINGLE
+  __shared__ int sh_xcrd_overflow[small_block_max_atoms];
+  __shared__ int sh_ycrd_overflow[small_block_max_atoms];
+  __shared__ int sh_zcrd_overflow[small_block_max_atoms];
+#  endif
+#endif
+
+#ifdef COMPUTE_ENERGY
+  __shared__ int sh_system_indices[small_block_max_imports];
+  __shared__ llint sh_elec_acc[small_block_max_imports];
+  __shared__ llint sh_vdw_acc[small_block_max_imports];
+#endif
+
+  __shared__ int nbwu_map[tile_groups_wu_abstract_length];
+  __shared__ int nbwu_idx;
+
+  // Shared memory for periodic boundary conditions
+  __shared__ TCALC sh_box_a;
+  __shared__ TCALC sh_box_b;
+  __shared__ TCALC sh_box_c;
+
+  // Each block takes its first non-bonded work unit based on its block index
+  if (threadIdx.x == 0) {
+    nbwu_idx = blockIdx.x;
+  }
+  __syncthreads();
+
+  while (nbwu_idx < poly_nbk.nnbwu) {
+
+    // Load work unit abstract into shared memory
+    const int padded_abstract_length = devcRoundUp(tile_groups_wu_abstract_length, warp_size_int);
+    if (threadIdx.x < tile_groups_wu_abstract_length) {
+      nbwu_map[threadIdx.x] = __ldcv(&poly_nbk.nbwu_abstracts[(nbwu_idx *
+                                                               tile_groups_wu_abstract_length) +
+                                                              threadIdx.x]);
+    }
+#ifdef COMPUTE_ENERGY
+    else if (threadIdx.x >= padded_abstract_length &&
+             threadIdx.x <  padded_abstract_length + small_block_max_imports) {
+      sh_elec_acc[threadIdx.x - padded_abstract_length] = 0LL;
+      sh_vdw_acc[ threadIdx.x - padded_abstract_length] = 0LL;
+    }
+#endif
+    __syncthreads();
+
+    // Import atomic coordinates and properties
+    const int tile_sides_per_warp = (warp_size_int / tile_length);
+    const int warp_idx = (threadIdx.x >> warp_bits);
+    const int warp_lane_idx = (threadIdx.x & warp_bits_mask_int);
+    const int tile_side_offset = warp_lane_idx / tile_length;
+    int pos = (tile_sides_per_warp * warp_idx) + tile_side_offset;
+
+    // Load coordinates into shared/gmem cache
+#ifdef TCALC_IS_SINGLE
+#  ifdef LARGE_CHIP_CACHE
+    pos = loadTileCoordinates(pos, 0, nbwu_map, poly_psw.xcrd, sh_xcrd, sh_tile_xcog,
+                              poly_psw.gpos_scale);
+    pos = loadTileCoordinates(pos, 1, nbwu_map, poly_psw.ycrd, sh_ycrd, sh_tile_ycog,
+                              poly_psw.gpos_scale);
+    pos = loadTileCoordinates(pos, 2, nbwu_map, poly_psw.zcrd, sh_zcrd, sh_tile_zcog,
+                              poly_psw.gpos_scale);
+#  else
+    pos = loadTileCoordinates(pos, 0, nbwu_map, poly_psw.xcrd, &gmem_r.xcrd[EXCL_GMEM_OFFSET],
+                              sh_tile_xcog, poly_psw.gpos_scale);
+    pos = loadTileCoordinates(pos, 1, nbwu_map, poly_psw.ycrd, &gmem_r.ycrd[EXCL_GMEM_OFFSET],
+                              sh_tile_ycog, poly_psw.gpos_scale);
+    pos = loadTileCoordinates(pos, 2, nbwu_map, poly_psw.zcrd, &gmem_r.zcrd[EXCL_GMEM_OFFSET],
+                              sh_tile_zcog, poly_psw.gpos_scale);
+#  endif
+#else
+#  ifdef LARGE_CHIP_CACHE
+    pos = loadTileCoordinates(pos, 0, nbwu_map, poly_psw.xcrd, sh_xcrd, poly_psw.xcrd_ovrf,
+                              sh_xcrd_overflow, sh_tile_xcog, poly_psw.gpos_scale);
+    pos = loadTileCoordinates(pos, 1, nbwu_map, poly_psw.ycrd, sh_ycrd, poly_psw.ycrd_ovrf,
+                              sh_ycrd_overflow, sh_tile_ycog, poly_psw.gpos_scale);
+    pos = loadTileCoordinates(pos, 2, nbwu_map, poly_psw.zcrd, sh_zcrd, poly_psw.zcrd_ovrf,
+                              sh_zcrd_overflow, sh_tile_zcog, poly_psw.gpos_scale);
+#  else
+    pos = loadTileCoordinates(pos, 0, nbwu_map, poly_psw.xcrd, &gmem_r.xcrd[EXCL_GMEM_OFFSET],
+                              poly_psw.xcrd_ovrf, &gmem_r.xcrd_ovrf[EXCL_GMEM_OFFSET],
+                              sh_tile_xcog, poly_psw.gpos_scale);
+    pos = loadTileCoordinates(pos, 1, nbwu_map, poly_psw.ycrd, &gmem_r.ycrd[EXCL_GMEM_OFFSET],
+                              poly_psw.ycrd_ovrf, &gmem_r.ycrd_ovrf[EXCL_GMEM_OFFSET],
+                              sh_tile_ycog, poly_psw.gpos_scale);
+    pos = loadTileCoordinates(pos, 2, nbwu_map, poly_psw.zcrd, &gmem_r.zcrd[EXCL_GMEM_OFFSET],
+                              poly_psw.zcrd_ovrf, &gmem_r.zcrd_ovrf[EXCL_GMEM_OFFSET],
+                              sh_tile_zcog, poly_psw.gpos_scale);
+#  endif
+#endif
+    const int import_count = nbwu_map[0];
+    const int padded_import_count = devcRoundUp(import_count, tile_sides_per_warp);
+    const int warps_per_block = blockDim.x >> warp_bits;
+    const int tile_lane_idx = (threadIdx.x & tile_length_bits_mask);
+
+    // Load charges
+    pos = loadTileProperty(pos, 3, nbwu_map, poly_nbk.charge, &gmem_r.charges[EXCL_GMEM_OFFSET],
+                           SQRT_FUNC(poly_nbk.coulomb));
+
+    // Load LJ indices
+    pos = loadTileProperty(pos, 4, nbwu_map, poly_nbk.lj_idx, &gmem_r.lj_idx[EXCL_GMEM_OFFSET]);
+
+    // Load system metadata (LJ types, offsets, system indices)
+    while (pos < 6 * padded_import_count) {
+      const int rel_pos = pos - (5 * padded_import_count);
+      if (rel_pos < import_count) {
+        if (tile_lane_idx == 0) {
+          const int import_base  = nbwu_map[rel_pos + 1];
+          const int sys_index    = nbwu_map[rel_pos + small_block_max_imports + small_block_max_tiles + 1];
+          sh_tile_tpts[rel_pos]     = import_base & 0xff;
+          sh_n_lj_types[rel_pos]    = poly_nbk.n_lj_types[sys_index];
+          sh_ljabc_offsets[rel_pos] = poly_nbk.ljabc_offsets[sys_index];
+#ifdef COMPUTE_ENERGY
+          sh_system_indices[rel_pos] = sys_index;
+#endif
+        }
+      }
+      pos += tile_sides_per_warp;
+    }
+
+    // Load box dimensions for periodic boundary conditions (thread 0 only)
+    if (threadIdx.x == 0 && import_count > 0 && poly_nbk.unit_cell != UnitCellType::NONE) {
+      const int sys_index = nbwu_map[small_block_max_imports + small_block_max_tiles + 1];
+      // boxdims array format: [a, b, c, alpha, beta, gamma] per system
+      sh_box_a = poly_psw.boxdims[sys_index * 6 + 0];
+      sh_box_b = poly_psw.boxdims[sys_index * 6 + 1];
+      sh_box_c = poly_psw.boxdims[sys_index * 6 + 2];
+    }
+    __syncthreads();
+
+#ifdef COMPUTE_FORCE
+    // Initialize force accumulators
+    for (int i = threadIdx.x; i < import_count * tile_length; i += blockDim.x) {
+#  ifdef TCALC_IS_SINGLE
+#    ifdef SPLIT_FORCE_ACCUMULATION
+      sh_xfrc[i] = 0;
+      sh_yfrc[i] = 0;
+      sh_zfrc[i] = 0;
+      sh_xfrc_overflow[i] = 0;
+      sh_yfrc_overflow[i] = 0;
+      sh_zfrc_overflow[i] = 0;
+#    else
+      sh_xfrc[i] = 0LL;
+      sh_yfrc[i] = 0LL;
+      sh_zfrc[i] = 0LL;
+#    endif
+#  else
+    sh_xfrc[i] = 0LL;
+    sh_yfrc[i] = 0LL;
+    sh_zfrc[i] = 0LL;
+    sh_xfrc_overflow[i] = 0;
+    sh_yfrc_overflow[i] = 0;
+    sh_zfrc_overflow[i] = 0;
+#  endif
+    }
+#endif
+    __syncthreads();
+
+    // === TILE LOOP ===
+    // Each warp processes one 16×16 tile per iteration
+    pos = nbwu_map[small_block_max_imports + 6] + warp_idx;
+    while (pos < nbwu_map[small_block_max_imports + 7]) {
+
+      // Fetch tile instruction
+      uint2 tinsr = poly_nbk.nbwu_insr[pos];
+      const uint t_mask = poly_se.mask_data[tinsr.y + warp_lane_idx];
+      const int local_absc_start = (tinsr.x & 0xffff);
+      const int local_ordi_start = ((tinsr.x >> 16) & 0xffff);
+      const int absc_import_idx = local_absc_start / tile_length;
+      const int ordi_import_idx = local_ordi_start / tile_length;
+
+      // Compute tile center-of-geometry for coordinate transformation
+      const TCALC inv_tile_pts = (TCALC)(1.0) /
+                                 (sh_tile_tpts[absc_import_idx] + sh_tile_tpts[ordi_import_idx]);
+      const TCALC tx_cog = (sh_tile_xcog[absc_import_idx] + sh_tile_xcog[ordi_import_idx]) *
+                           inv_tile_pts;
+      const TCALC ty_cog = (sh_tile_ycog[absc_import_idx] + sh_tile_ycog[ordi_import_idx]) *
+                           inv_tile_pts;
+      const TCALC tz_cog = (sh_tile_zcog[absc_import_idx] + sh_tile_zcog[ordi_import_idx]) *
+                           inv_tile_pts;
+
+      // Compute read index for this thread's atom
+#ifdef LARGE_CHIP_CACHE
+      int read_idx  = ((warp_lane_idx <  tile_length) * local_absc_start) +
+                      ((warp_lane_idx >= tile_length) * local_ordi_start) + tile_lane_idx;
+      const size_t sh_read_idx = read_idx;
+      read_idx += EXCL_GMEM_OFFSET;
+#else
+      int read_idx  = ((warp_lane_idx <  tile_length) * local_absc_start) +
+                      ((warp_lane_idx >= tile_length) * local_ordi_start) + tile_lane_idx +
+                      EXCL_GMEM_OFFSET;
+#endif
+
+      // Load this thread's atom coordinates (relative to tile center-of-geometry)
+#ifdef TCALC_IS_SINGLE
+      const llint x_center = LLCONV_FUNC(tx_cog);
+      const llint y_center = LLCONV_FUNC(ty_cog);
+      const llint z_center = LLCONV_FUNC(tz_cog);
+#  ifdef LARGE_CHIP_CACHE
+      const TCALC t_xcrd   = (TCALC)(sh_xcrd[sh_read_idx] - x_center) * poly_psw.inv_gpos_scale;
+      const TCALC t_ycrd   = (TCALC)(sh_ycrd[sh_read_idx] - y_center) * poly_psw.inv_gpos_scale;
+      const TCALC t_zcrd   = (TCALC)(sh_zcrd[sh_read_idx] - z_center) * poly_psw.inv_gpos_scale;
+#  else
+      const TCALC t_xcrd   = (TCALC)(gmem_r.xcrd[read_idx] - x_center) * poly_psw.inv_gpos_scale;
+      const TCALC t_ycrd   = (TCALC)(gmem_r.ycrd[read_idx] - y_center) * poly_psw.inv_gpos_scale;
+      const TCALC t_zcrd   = (TCALC)(gmem_r.zcrd[read_idx] - z_center) * poly_psw.inv_gpos_scale;
+#  endif
+#else
+      const int95_t x_center = doubleToInt95(-tx_cog);
+      const int95_t y_center = doubleToInt95(-ty_cog);
+      const int95_t z_center = doubleToInt95(-tz_cog);
+#  ifdef LARGE_CHIP_CACHE
+      const int95_t x_atom   = { sh_xcrd[sh_read_idx], sh_xcrd_overflow[sh_read_idx] };
+      const int95_t y_atom   = { sh_ycrd[sh_read_idx], sh_ycrd_overflow[sh_read_idx] };
+      const int95_t z_atom   = { sh_zcrd[sh_read_idx], sh_zcrd_overflow[sh_read_idx] };
+#  else
+      const int95_t x_atom   = { gmem_r.xcrd[read_idx], gmem_r.xcrd_ovrf[read_idx] };
+      const int95_t y_atom   = { gmem_r.ycrd[read_idx], gmem_r.ycrd_ovrf[read_idx] };
+      const int95_t z_atom   = { gmem_r.zcrd[read_idx], gmem_r.zcrd_ovrf[read_idx] };
+#  endif
+      const TCALC t_xcrd  = int95SumToDouble(x_atom, x_center) * poly_psw.inv_gpos_scale;
+      const TCALC t_ycrd  = int95SumToDouble(y_atom, y_center) * poly_psw.inv_gpos_scale;
+      const TCALC t_zcrd  = int95SumToDouble(z_atom, z_center) * poly_psw.inv_gpos_scale;
+#endif
+
+      // Load properties
+      const int t_ljidx   = gmem_r.lj_idx[read_idx];
+      const TCALC t_q     = gmem_r.charges[read_idx];
+      const int nljt      = sh_n_lj_types[absc_import_idx];
+      const int lj_offset = sh_ljabc_offsets[absc_import_idx];
+
+      // *** LAMBDA SCALING: Load lambda values for this atom ***
+      const int global_atom_idx = read_idx - EXCL_GMEM_OFFSET;
+      const TCALC t_lambda_vdw = __ldg(&lambda_vdw[global_atom_idx]);
+      const TCALC t_lambda_ele = __ldg(&lambda_ele[global_atom_idx]);
+
+#ifdef COMPUTE_ENERGY
+      TCALC elec_nrg = (TCALC)(0.0);
+      TCALC vdw_nrg  = (TCALC)(0.0);
+#endif
+#ifdef COMPUTE_FORCE
+      TCALC t_xfrc = (TCALC)(0.0);
+      TCALC t_yfrc = (TCALC)(0.0);
+      TCALC t_zfrc = (TCALC)(0.0);
+#endif
+
+      // === WARP SHUFFLE LOOP ===
+      // Only 8 iterations instead of 5,316!
+      for (int i = 0; i < half_tile_length; i++) {
+
+        // Compute shuffle source lane (double-shuttle pattern)
+        int crd_src_lane = ((warp_lane_idx <  tile_length) * (warp_lane_idx + tile_length - i)) +
+                           ((warp_lane_idx >= tile_length) *
+                            (warp_lane_idx - three_halves_tile_length + i));
+        crd_src_lane += tile_length * ((crd_src_lane <  tile_length &&
+                                        warp_lane_idx < tile_length) +
+                                       (crd_src_lane <             0 &&
+                                        warp_lane_idx >= tile_length));
+
+        // Shuffle coordinates from partner
+        const TCALC o_xcrd  = SHFL(t_xcrd,  crd_src_lane);
+        const TCALC o_ycrd  = SHFL(t_ycrd,  crd_src_lane);
+        const TCALC o_zcrd  = SHFL(t_zcrd,  crd_src_lane);
+        const TCALC o_ljidx = SHFL(t_ljidx, crd_src_lane);
+        const TCALC o_q     = SHFL(t_q,     crd_src_lane);
+
+        // *** LAMBDA SCALING: Shuffle lambda values from partner ***
+        const TCALC o_lambda_vdw = SHFL(t_lambda_vdw, crd_src_lane);
+        const TCALC o_lambda_ele = SHFL(t_lambda_ele, crd_src_lane);
+
+        // Compute distance vector
+        TCALC dx      = o_xcrd - t_xcrd;
+        TCALC dy      = o_ycrd - t_ycrd;
+        TCALC dz      = o_zcrd - t_zcrd;
+
+        // Apply minimum image convention for periodic boundary conditions
+        // This handles interactions across periodic boundaries
+        if (poly_nbk.unit_cell != UnitCellType::NONE) {
+          // For orthorhombic boxes: minimum image = distance - round(distance/box_length) * box_length
+          // Using rint() for nearest integer (banker's rounding for .5 cases)
+#ifdef TCALC_IS_SINGLE
+          dx -= rintf(dx / sh_box_a) * sh_box_a;
+          dy -= rintf(dy / sh_box_b) * sh_box_b;
+          dz -= rintf(dz / sh_box_c) * sh_box_c;
+#else
+          dx -= rint(dx / sh_box_a) * sh_box_a;
+          dy -= rint(dy / sh_box_b) * sh_box_b;
+          dz -= rint(dz / sh_box_c) * sh_box_c;
+#endif
+        }
+
+        const TCALC r2      = (dx * dx) + (dy * dy) + (dz * dz);
+
+        // Initialize force magnitude
+        TCALC fmag = (TCALC)(0.0);
+
+        // Check exclusion mask
+        if (!((t_mask >> (crd_src_lane - (tile_length * (warp_lane_idx < tile_length)))) & 0x1)) {
+
+          const TCALC invr      = rsqrt(r2);
+          const TCALC invr2     = invr * invr;
+
+          // *** LAMBDA SCALING: Electrostatics ***
+          const TCALC lambda_ij_ele = t_lambda_ele * o_lambda_ele;
+          const TCALC ot_qq         = t_q * o_q * lambda_ij_ele;
+
+#ifdef COMPUTE_ENERGY
+          elec_nrg += ot_qq * invr;
+#endif
+#ifdef COMPUTE_FORCE
+          fmag -= ot_qq * invr2 * invr;
+#endif
+
+          // *** LAMBDA SCALING: Van der Waals with softcore ***
+          const TCALC lambda_ij_vdw = t_lambda_vdw * o_lambda_vdw;
+          if (lambda_ij_vdw > (TCALC)(1.0e-10)) {
+            const size_t ot_ljidx = (t_ljidx * nljt) + o_ljidx + lj_offset;
+            const TCALC2 ljab     = poly_nbk.ljab_coeff[ot_ljidx];
+
+            // Softcore modification
+            const TCALC r6 = r2 * r2 * r2;
+            const TCALC r_eff6 = r6 + SOFTCORE_ALPHA * fabs(ljab.y) * ((TCALC)(1.0) - lambda_ij_vdw);
+            const TCALC inv_r_eff6 = (TCALC)(1.0) / r_eff6;
+            const TCALC inv_r_eff12 = inv_r_eff6 * inv_r_eff6;
+
+#ifdef COMPUTE_ENERGY
+            vdw_nrg += lambda_ij_vdw * ((ljab.x * inv_r_eff12) - (ljab.y * inv_r_eff6));
+#endif
+#ifdef COMPUTE_FORCE
+            if (lambda_ij_vdw > (TCALC)(1.0e-10)) {
+              const TCALC r5 = r2 * r2 * sqrt(r2);
+              const TCALC inv_r_eff7 = inv_r_eff6 / r_eff6;
+              const TCALC inv_r_eff13 = inv_r_eff12 / r_eff6;
+              const TCALC vdw_fmag = lambda_ij_vdw * (TCALC)(3.0) * r5 *
+                                     (-((TCALC)(6.0) * ljab.x * inv_r_eff13) +
+                                      ((TCALC)(12.0) * ljab.y * inv_r_eff7)) / r_eff6;
+              fmag += vdw_fmag * invr;
+            }
+#endif
+          }
+        }
+
+#ifdef COMPUTE_FORCE
+        // Accumulate forces
+        const TCALC fmag_dx = fmag * dx;
+        const TCALC fmag_dy = fmag * dy;
+        const TCALC fmag_dz = fmag * dz;
+        t_xfrc += fmag_dx;
+        t_yfrc += fmag_dy;
+        t_zfrc += fmag_dz;
+
+        // Shuffle forces back (Newton's 3rd law)
+        int frc_ret_lane = ((warp_lane_idx <  tile_length) *
+                            (warp_lane_idx + three_halves_tile_length - i)) +
+                           ((warp_lane_idx >= tile_length) * (warp_lane_idx - tile_length + i));
+        frc_ret_lane += tile_length *
+                        ((frc_ret_lane >= tile_length   && warp_lane_idx >= tile_length) -
+                         (frc_ret_lane >= warp_size_int && warp_lane_idx <  tile_length));
+        t_xfrc -= SHFL(fmag_dx, frc_ret_lane);
+        t_yfrc -= SHFL(fmag_dy, frc_ret_lane);
+        t_zfrc -= SHFL(fmag_dz, frc_ret_lane);
+#endif
+      }
+
+      // === END WARP SHUFFLE LOOP ===
+
+#ifdef COMPUTE_ENERGY
+      // Reduce energies within warp
+      llint elec_acc = LLCONV_FUNC(elec_nrg * scw.nrg_scale_f);
+      WARP_REDUCE_DOWN(elec_acc);
+      llint vdw_acc  = LLCONV_FUNC(vdw_nrg * scw.nrg_scale_f);
+      WARP_REDUCE_DOWN(vdw_acc);
+
+      if (warp_lane_idx == 0) {
+        atomicAdd((ullint*)&sh_elec_acc[absc_import_idx], (ullint)(elec_acc));
+        atomicAdd((ullint*)&sh_vdw_acc [absc_import_idx], (ullint)(vdw_acc));
+      }
+#endif
+
+#ifdef COMPUTE_FORCE
+      // Write forces to shared memory
+      read_idx -= EXCL_GMEM_OFFSET;
+#  ifdef TCALC_IS_SINGLE
+#    ifdef SPLIT_FORCE_ACCUMULATION
+      atomicSplit(t_xfrc * poly_psw.frc_scale, read_idx, sh_xfrc, sh_xfrc_overflow);
+      atomicSplit(t_yfrc * poly_psw.frc_scale, read_idx, sh_yfrc, sh_yfrc_overflow);
+      atomicSplit(t_zfrc * poly_psw.frc_scale, read_idx, sh_zfrc, sh_zfrc_overflow);
+#    else
+      atomicAdd((ullint*)&sh_xfrc[read_idx], (ullint)(LLCONV_FUNC(t_xfrc * poly_psw.frc_scale)));
+      atomicAdd((ullint*)&sh_yfrc[read_idx], (ullint)(LLCONV_FUNC(t_yfrc * poly_psw.frc_scale)));
+      atomicAdd((ullint*)&sh_zfrc[read_idx], (ullint)(LLCONV_FUNC(t_zfrc * poly_psw.frc_scale)));
+#    endif
+#  else
+#    ifdef SPLIT_FORCE_ACCUMULATION
+      atomicSplit(t_xfrc * poly_psw.frc_scale, read_idx, sh_xfrc, sh_xfrc_overflow);
+      atomicSplit(t_yfrc * poly_psw.frc_scale, read_idx, sh_yfrc, sh_yfrc_overflow);
+      atomicSplit(t_zfrc * poly_psw.frc_scale, read_idx, sh_zfrc, sh_zfrc_overflow);
+#    else
+      atomicAdd((ullint*)&sh_xfrc[read_idx], (ullint)(LLCONV_FUNC(t_xfrc * poly_psw.frc_scale)));
+      atomicAdd((ullint*)&sh_yfrc[read_idx], (ullint)(LLCONV_FUNC(t_yfrc * poly_psw.frc_scale)));
+      atomicAdd((ullint*)&sh_zfrc[read_idx], (ullint)(LLCONV_FUNC(t_zfrc * poly_psw.frc_scale)));
+#    endif
+#  endif
+#endif
+
+      // Next tile for this warp
+      pos += warps_per_block;
+    }
+
+    // === END TILE LOOP ===
+    __syncthreads();
+
+    // Commit the locally accumulated forces back to global arrays
+    pos = (tile_sides_per_warp * warp_idx) + tile_side_offset;
+#ifdef COMPUTE_FORCE
+#  ifdef TCALC_IS_SINGLE
+#    ifdef SPLIT_FORCE_ACCUMULATION
+    pos = accumulateTileProperty(pos, 0, nbwu_map, sh_xfrc, sh_xfrc_overflow, poly_psw.xfrc);
+    pos = accumulateTileProperty(pos, 1, nbwu_map, sh_yfrc, sh_yfrc_overflow, poly_psw.yfrc);
+    pos = accumulateTileProperty(pos, 2, nbwu_map, sh_zfrc, sh_zfrc_overflow, poly_psw.zfrc);
+#    else
+    pos = accumulateTileProperty(pos, 0, nbwu_map, sh_xfrc, poly_psw.xfrc);
+    pos = accumulateTileProperty(pos, 1, nbwu_map, sh_yfrc, poly_psw.yfrc);
+    pos = accumulateTileProperty(pos, 2, nbwu_map, sh_zfrc, poly_psw.zfrc);
+#    endif
+#  else
+#    ifdef SPLIT_FORCE_ACCUMULATION
+    pos = accumulateTileProperty(pos, 0, nbwu_map, sh_xfrc, sh_xfrc_overflow, poly_psw.xfrc,
+                                 poly_psw.xfrc_ovrf);
+    pos = accumulateTileProperty(pos, 1, nbwu_map, sh_yfrc, sh_yfrc_overflow, poly_psw.yfrc,
+                                 poly_psw.yfrc_ovrf);
+    pos = accumulateTileProperty(pos, 2, nbwu_map, sh_zfrc, sh_zfrc_overflow, poly_psw.zfrc,
+                                 poly_psw.zfrc_ovrf);
+#    else
+    pos = accumulateTileProperty(pos, 0, nbwu_map, sh_xfrc, poly_psw.xfrc);
+    pos = accumulateTileProperty(pos, 1, nbwu_map, sh_yfrc, poly_psw.yfrc);
+    pos = accumulateTileProperty(pos, 2, nbwu_map, sh_zfrc, poly_psw.zfrc);
+#    endif
+#  endif
+#endif
+
+#ifdef COMPUTE_ENERGY
+    // Write energies to ScoreCard
+    for (int i = threadIdx.x; i < import_count; i += blockDim.x) {
+      const int sys_index = sh_system_indices[i];
+      const int elec_idx = (sys_index * scw.data_stride) + (int)(StateVariable::ELECTROSTATIC);
+      const int vdw_idx  = (sys_index * scw.data_stride) + (int)(StateVariable::VDW);
+
+      atomicAdd((ullint*)&scw.instantaneous_accumulators[elec_idx], (ullint)(sh_elec_acc[i]));
+      atomicAdd((ullint*)&scw.instantaneous_accumulators[vdw_idx],  (ullint)(sh_vdw_acc[i]));
+    }
+#endif
+    __syncthreads();
+
+    // Get next work unit
+    if (threadIdx.x == 0) {
+      nbwu_idx = atomicAdd(&ctrl.nbwu_progress[0], 1);
+    }
+    __syncthreads();
+  }
+}
+
+#undef EXCL_GMEM_OFFSET

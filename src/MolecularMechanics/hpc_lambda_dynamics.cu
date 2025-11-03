@@ -18,6 +18,10 @@
 #include "MolecularMechanics/mm_controls.h"
 #include "Numerics/numeric_enumerators.h"
 #include "hpc_lambda_dynamics.h"
+#include <chrono>
+#ifdef STORMM_USE_CUDA
+#include <nvtx3/nvToolsExt.h>
+#endif
 
 namespace stormm {
 namespace mm {
@@ -197,6 +201,8 @@ void launchLambdaDynamicsStep(
 
   // Call high-level lambda nonbonded launcher (matches standard dynamics pattern)
   // This extracts coordinates/forces internally from PhaseSpaceSynthesis
+  nvtxRangePushA("launchLambdaNonbonded");
+  const auto nonbond_start = std::chrono::high_resolution_clock::now();
   energy::launchLambdaNonbonded(
       lambda_vdw,                       // Per-atom VDW lambda (device array)
       lambda_ele,                       // Per-atom electrostatic lambda (device array)
@@ -214,11 +220,22 @@ void launchLambdaDynamicsStep(
       EvaluateForce::YES,               // We need forces computed
       eval_energy,                      // Energy evaluation (only on diagnostic steps)
       launcher);                        // Kernel launch manager
+  cudaDeviceSynchronize();
+  const double nonbond_ms = std::chrono::duration<double, std::milli>(
+      std::chrono::high_resolution_clock::now() - nonbond_start).count();
+  nvtxRangePop();
+
+  if (eval_energy == EvaluateEnergy::YES) {
+    printf("[lambda_dynamics] Nonbonded kernel: %.3f ms (n_coupled=%d)\n",
+           nonbond_ms, n_coupled);
+  }
 
   // Call valence kernel to:
   // 1. Compute bonded forces (NOT lambda-scaled - correct for GCMC)
   // 2. Perform full Velocity Verlet integration with constraints
   // 3. Apply thermostat if present
+  nvtxRangePushA("launchValence");
+  const auto valence_start = std::chrono::high_resolution_clock::now();
   launchValence(
       PrecisionModel::DOUBLE,           // Match coordinate/force precision
       poly_ag,                           // Topology synthesis
@@ -233,6 +250,14 @@ void launchLambdaDynamicsStep(
       launcher,                          // Kernel launch parameters
       0.0,                               // clash_distance (no clash mitigation)
       0.0);                              // clash_ratio (no clash mitigation)
+  cudaDeviceSynchronize();
+  const double valence_ms = std::chrono::duration<double, std::milli>(
+      std::chrono::high_resolution_clock::now() - valence_start).count();
+  nvtxRangePop();
+
+  if (eval_energy == EvaluateEnergy::YES) {
+    printf("[lambda_dynamics] Valence kernel: %.3f ms\n", valence_ms);
+  }
 }
 
 } // namespace mm

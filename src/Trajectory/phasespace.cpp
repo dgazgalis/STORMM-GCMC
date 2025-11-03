@@ -1786,6 +1786,45 @@ void PhaseSpace::uploadPositions() {
 }
 
 //-------------------------------------------------------------------------------------------------
+void PhaseSpace::uploadAtoms(const int atom_start, const int n_atoms,
+                              const CoordinateCycle orientation) {
+  // Bounds checking
+  if (atom_start < 0 || atom_start >= atom_count) {
+    rtErr("Atom start index " + std::to_string(atom_start) + " is out of bounds [0, " +
+          std::to_string(atom_count) + ").", "PhaseSpace", "uploadAtoms");
+  }
+  if (n_atoms <= 0 || atom_start + n_atoms > atom_count) {
+    rtErr("Atom count " + std::to_string(n_atoms) + " starting at " +
+          std::to_string(atom_start) + " exceeds system size " +
+          std::to_string(atom_count) + ".", "PhaseSpace", "uploadAtoms");
+  }
+
+  // Upload the contiguous subset of X, Y, Z coordinates
+  // Each dimension is stored separately in the storage array with stride padding
+  const int stride = roundUp(atom_count, warp_size_int);
+
+  switch (orientation) {
+  case CoordinateCycle::WHITE:
+    // WHITE coordinates are at storage[0, 3*stride): X, Y, Z sequentially
+    storage.upload(atom_start              , n_atoms);  // X coordinates
+    storage.upload(atom_start + stride     , n_atoms);  // Y coordinates
+    storage.upload(atom_start + 2 * stride , n_atoms);  // Z coordinates
+    break;
+  case CoordinateCycle::BLACK:
+    // BLACK coordinates are at storage[3*stride, 6*stride): X, Y, Z sequentially
+    storage.upload(atom_start + 3 * stride , n_atoms);  // X coordinates
+    storage.upload(atom_start + 4 * stride , n_atoms);  // Y coordinates
+    storage.upload(atom_start + 5 * stride , n_atoms);  // Z coordinates
+    break;
+  }
+}
+
+//-------------------------------------------------------------------------------------------------
+void PhaseSpace::uploadAtoms(const int atom_start, const int n_atoms) {
+  uploadAtoms(atom_start, n_atoms, cycle_position);
+}
+
+//-------------------------------------------------------------------------------------------------
 void PhaseSpace::uploadTransformations() {
   const int stride = roundUp(atom_count, warp_size_int);
   storage.upload(9 * stride, 3 * roundUp(9, warp_size_int));

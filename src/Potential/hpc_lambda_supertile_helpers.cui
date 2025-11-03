@@ -1,0 +1,271 @@
+// -*-c++-*-
+#include "copyright.h"
+
+/// \brief Helper functions for lambda-scaled supertile nonbonded kernels
+///
+/// These functions load coordinates and properties for supertile work units.
+/// Supertile work units use an 8-integer abstract format (vs 64-integer tile-group format).
+///
+/// Abstract format:
+/// [0]: absc_start  - Starting atom index for abscissa
+/// [1]: absc_length - Number of atoms in abscissa (up to 256)
+/// [2]: ordi_start  - Starting atom index for ordinate
+/// [3]: ordi_length - Number of atoms in ordinate (up to 256)
+/// [4]: system_index
+/// [5]: init_accumulation
+/// [6]: tile_range_start - First tile instruction index
+/// [7]: tile_range_end   - Last tile instruction index
+
+//-------------------------------------------------------------------------------------------------
+// Load coordinates for supertile work unit (single precision, no overflow)
+//-------------------------------------------------------------------------------------------------
+__device__ int loadSupertileCoordinates(const int pos, const int iter, const int* nbwu_map,
+                                        const llint* read_crd, llint* write_crd,
+                                        float* sh_tile_cog, const float gpos_scale) {
+  const int tile_sides_per_warp = (warp_size_int / tile_length);
+  const int warps_per_block = blockDim.x >> warp_bits;
+  const int tile_lane_idx = (threadIdx.x & tile_length_bits_mask);
+
+  // Parse supertile abstract
+  const int absc_start = nbwu_map[0];
+  const int absc_length = nbwu_map[1];
+  const int ordi_start = nbwu_map[2];
+  const int ordi_length = nbwu_map[3];
+
+  // Compute import counts (number of 16-atom tiles needed)
+  const int absc_imports = (absc_length + tile_length - 1) / tile_length;
+  const int ordi_imports = (ordi_length + tile_length - 1) / tile_length;
+  const int import_count = absc_imports + ordi_imports;
+  const int padded_import_count = devcRoundUp(import_count, tile_sides_per_warp);
+
+  int rel_pos = pos - (iter * padded_import_count);
+  while (rel_pos < padded_import_count) {
+    float fval;
+    if (rel_pos < import_count) {
+      // Determine if this is abscissa or ordinate import
+      const bool is_absc = (rel_pos < absc_imports);
+      const int import_base = is_absc ? absc_start : ordi_start;
+      const int import_length = is_absc ? absc_length : ordi_length;
+      const int local_tile_idx = is_absc ? rel_pos : (rel_pos - absc_imports);
+
+      const size_t read_idx = import_base + (local_tile_idx * tile_length) + tile_lane_idx;
+      const size_t write_idx = (rel_pos * tile_length) + tile_lane_idx;
+
+      // Check if this lane has a valid atom
+      const int local_atom_idx = (local_tile_idx * tile_length) + tile_lane_idx;
+      if (local_atom_idx < import_length) {
+        const llint ival = __ldcs(&read_crd[read_idx]);
+        fval = (float)(ival);
+        write_crd[write_idx] = ival;
+      }
+      else {
+        fval = (float)(0.0);
+        write_crd[write_idx] = (128 * (rel_pos + 8) * tile_lane_idx) * gpos_scale;
+      }
+    }
+    else {
+      fval = (float)(0.0);
+    }
+
+    // Compute center-of-geometry via warp reduction
+    for (int i = half_tile_length; i > 0; i >>= 1) {
+      fval += SHFL_DOWN(fval, i);
+    }
+    if (tile_lane_idx == 0 && rel_pos < import_count) {
+      sh_tile_cog[rel_pos] = fval;
+    }
+    rel_pos += tile_sides_per_warp * warps_per_block;
+  }
+  return rel_pos + (iter * padded_import_count);
+}
+
+//-------------------------------------------------------------------------------------------------
+// Load coordinates for supertile work unit (double precision with overflow)
+//-------------------------------------------------------------------------------------------------
+__device__ int loadSupertileCoordinates(const int pos, const int iter, const int* nbwu_map,
+                                        const llint* read_crd, llint* write_crd,
+                                        const int* read_crd_ovrf, int* write_crd_ovrf,
+                                        double* sh_tile_cog, const double gpos_scale) {
+  const int tile_sides_per_warp = (warp_size_int / tile_length);
+  const int warps_per_block = blockDim.x >> warp_bits;
+  const int tile_lane_idx = (threadIdx.x & tile_length_bits_mask);
+
+  // Parse supertile abstract
+  const int absc_start = nbwu_map[0];
+  const int absc_length = nbwu_map[1];
+  const int ordi_start = nbwu_map[2];
+  const int ordi_length = nbwu_map[3];
+
+  // Compute import counts
+  const int absc_imports = (absc_length + tile_length - 1) / tile_length;
+  const int ordi_imports = (ordi_length + tile_length - 1) / tile_length;
+  const int import_count = absc_imports + ordi_imports;
+  const int padded_import_count = devcRoundUp(import_count, tile_sides_per_warp);
+
+  int rel_pos = pos - (iter * padded_import_count);
+  while (rel_pos < padded_import_count) {
+    double fval;
+    if (rel_pos < import_count) {
+      const bool is_absc = (rel_pos < absc_imports);
+      const int import_base = is_absc ? absc_start : ordi_start;
+      const int import_length = is_absc ? absc_length : ordi_length;
+      const int local_tile_idx = is_absc ? rel_pos : (rel_pos - absc_imports);
+
+      const size_t read_idx = import_base + (local_tile_idx * tile_length) + tile_lane_idx;
+      const size_t write_idx = (rel_pos * tile_length) + tile_lane_idx;
+
+      const int local_atom_idx = (local_tile_idx * tile_length) + tile_lane_idx;
+      if (local_atom_idx < import_length) {
+        const llint ival = __ldcs(&read_crd[read_idx]);
+        fval = (double)(ival);
+        write_crd[write_idx] = ival;
+        const int ival_ovrf = __ldcs(&read_crd_ovrf[read_idx]);
+        fval += (double)(ival_ovrf) * max_llint_accumulation;
+        write_crd_ovrf[write_idx] = ival_ovrf;
+      }
+      else {
+        fval = (double)(0.0);
+        write_crd[write_idx] = (128 * (rel_pos + 8) * tile_lane_idx) * gpos_scale;
+        write_crd_ovrf[write_idx] = 0;
+      }
+    }
+    else {
+      fval = (double)(0.0);
+    }
+
+    // Compute center-of-geometry
+    for (int i = half_tile_length; i > 0; i >>= 1) {
+      fval += SHFL_DOWN(fval, i);
+    }
+    if (tile_lane_idx == 0 && rel_pos < import_count) {
+      sh_tile_cog[rel_pos] = fval;
+    }
+    rel_pos += tile_sides_per_warp * warps_per_block;
+  }
+  return rel_pos + (iter * padded_import_count);
+}
+
+//-------------------------------------------------------------------------------------------------
+// Load properties (charges, LJ indices) for supertile work unit
+//-------------------------------------------------------------------------------------------------
+template <typename T>
+__device__ int loadSupertileProperty(const int pos, const int iter, const int* nbwu_map,
+                                     const T* read_prop, T* write_prop, const T scaling = 1.0) {
+  const int tile_sides_per_warp = (warp_size_int / tile_length);
+  const int warps_per_block = blockDim.x >> warp_bits;
+  const int tile_lane_idx = (threadIdx.x & tile_length_bits_mask);
+
+  // Parse supertile abstract
+  const int absc_start = nbwu_map[0];
+  const int absc_length = nbwu_map[1];
+  const int ordi_start = nbwu_map[2];
+  const int ordi_length = nbwu_map[3];
+
+  const int absc_imports = (absc_length + tile_length - 1) / tile_length;
+  const int ordi_imports = (ordi_length + tile_length - 1) / tile_length;
+  const int import_count = absc_imports + ordi_imports;
+  const int padded_import_count = devcRoundUp(import_count, tile_sides_per_warp);
+
+  int rel_pos = pos - (iter * padded_import_count);
+  while (rel_pos < padded_import_count) {
+    if (rel_pos < import_count) {
+      const bool is_absc = (rel_pos < absc_imports);
+      const int import_base = is_absc ? absc_start : ordi_start;
+      const int import_length = is_absc ? absc_length : ordi_length;
+      const int local_tile_idx = is_absc ? rel_pos : (rel_pos - absc_imports);
+
+      const size_t read_idx = import_base + (local_tile_idx * tile_length) + tile_lane_idx;
+      const size_t write_idx = (rel_pos * tile_length) + tile_lane_idx;
+
+      const int local_atom_idx = (local_tile_idx * tile_length) + tile_lane_idx;
+      if (local_atom_idx < import_length) {
+        write_prop[write_idx] = __ldg(&read_prop[read_idx]) * scaling;
+      }
+    }
+    rel_pos += tile_sides_per_warp * warps_per_block;
+  }
+  return rel_pos + (iter * padded_import_count);
+}
+
+//-------------------------------------------------------------------------------------------------
+// Accumulate forces from shared memory back to global memory for supertile work unit
+//-------------------------------------------------------------------------------------------------
+template <typename Tacc, typename Tover>
+__device__ int accumulateSupertileProperty(const int pos, const int iter, const int* nbwu_map,
+                                           const Tacc* sh_prop, const Tover* sh_prop_ovrf,
+                                           Tacc* glob_prop, Tover* glob_prop_ovrf) {
+  const int tile_sides_per_warp = (warp_size_int / tile_length);
+  const int warps_per_block = blockDim.x >> warp_bits;
+  const int tile_lane_idx = (threadIdx.x & tile_length_bits_mask);
+
+  // Parse supertile abstract
+  const int absc_start = nbwu_map[0];
+  const int absc_length = nbwu_map[1];
+  const int ordi_start = nbwu_map[2];
+  const int ordi_length = nbwu_map[3];
+
+  const int absc_imports = (absc_length + tile_length - 1) / tile_length;
+  const int ordi_imports = (ordi_length + tile_length - 1) / tile_length;
+  const int import_count = absc_imports + ordi_imports;
+  const int padded_import_count = devcRoundUp(import_count, tile_sides_per_warp);
+
+  int rel_pos = pos - (iter * padded_import_count);
+  while (rel_pos < padded_import_count) {
+    if (rel_pos < import_count) {
+      const bool is_absc = (rel_pos < absc_imports);
+      const int import_base = is_absc ? absc_start : ordi_start;
+      const int import_length = is_absc ? absc_length : ordi_length;
+      const int local_tile_idx = is_absc ? rel_pos : (rel_pos - absc_imports);
+
+      const size_t write_idx = import_base + (local_tile_idx * tile_length) + tile_lane_idx;
+      const size_t read_idx = (rel_pos * tile_length) + tile_lane_idx;
+
+      const int local_atom_idx = (local_tile_idx * tile_length) + tile_lane_idx;
+      if (local_atom_idx < import_length) {
+        atomicAdd((ullint*)&glob_prop[write_idx], (ullint)(sh_prop[read_idx]));
+        atomicAdd((unsigned int*)&glob_prop_ovrf[write_idx], (unsigned int)(sh_prop_ovrf[read_idx]));
+      }
+    }
+    rel_pos += tile_sides_per_warp * warps_per_block;
+  }
+  return rel_pos + (iter * padded_import_count);
+}
+
+// Overload for non-split accumulation (no overflow)
+template <typename Tacc>
+__device__ int accumulateSupertileProperty(const int pos, const int iter, const int* nbwu_map,
+                                           const Tacc* sh_prop, Tacc* glob_prop) {
+  const int tile_sides_per_warp = (warp_size_int / tile_length);
+  const int warps_per_block = blockDim.x >> warp_bits;
+  const int tile_lane_idx = (threadIdx.x & tile_length_bits_mask);
+
+  const int absc_start = nbwu_map[0];
+  const int absc_length = nbwu_map[1];
+  const int ordi_start = nbwu_map[2];
+  const int ordi_length = nbwu_map[3];
+
+  const int absc_imports = (absc_length + tile_length - 1) / tile_length;
+  const int ordi_imports = (ordi_length + tile_length - 1) / tile_length;
+  const int import_count = absc_imports + ordi_imports;
+  const int padded_import_count = devcRoundUp(import_count, tile_sides_per_warp);
+
+  int rel_pos = pos - (iter * padded_import_count);
+  while (rel_pos < padded_import_count) {
+    if (rel_pos < import_count) {
+      const bool is_absc = (rel_pos < absc_imports);
+      const int import_base = is_absc ? absc_start : ordi_start;
+      const int import_length = is_absc ? absc_length : ordi_length;
+      const int local_tile_idx = is_absc ? rel_pos : (rel_pos - absc_imports);
+
+      const size_t write_idx = import_base + (local_tile_idx * tile_length) + tile_lane_idx;
+      const size_t read_idx = (rel_pos * tile_length) + tile_lane_idx;
+
+      const int local_atom_idx = (local_tile_idx * tile_length) + tile_lane_idx;
+      if (local_atom_idx < import_length) {
+        atomicAdd((ullint*)&glob_prop[write_idx], (ullint)(sh_prop[read_idx]));
+      }
+    }
+    rel_pos += tile_sides_per_warp * warps_per_block;
+  }
+  return rel_pos + (iter * padded_import_count);
+}

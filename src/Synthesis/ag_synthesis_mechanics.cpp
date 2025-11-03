@@ -2690,12 +2690,11 @@ void AtomGraphSynthesis::loadNonbondedWorkUnits(const StaticExclusionMaskSynthes
   const bool prefer_supertile = (max_tile_count > large_nbwu_tiles);
   if (prefer_supertile) {
     rtWarn("One or more non-bonded work units require " + std::to_string(max_tile_count) +
-           " tiles, exceeding the current tile-group kernel support (" +
-           std::to_string(large_nbwu_tiles) + ").  Falling back to TILE_GROUPS layout, which may "
-           "be less efficient but remains compatible with available GPU kernels.",
+           " tiles, exceeding tile-group kernel limits (" + std::to_string(large_nbwu_tiles) +
+           ").  Switching to SUPERTILES layout for improved efficiency with high atom counts.",
            "AtomGraphSynthesis", "loadNonbondedWorkUnits");
   }
-  nonbonded_work_type = NbwuKind::TILE_GROUPS;
+  nonbonded_work_type = prefer_supertile ? NbwuKind::SUPERTILES : NbwuKind::TILE_GROUPS;
   switch (nonbonded_work_type) {
   case NbwuKind::TILE_GROUPS:
     nonbonded_abstracts.resize(nbwu_count * tile_groups_wu_abstract_length);

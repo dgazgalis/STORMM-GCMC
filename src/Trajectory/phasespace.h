@@ -602,6 +602,28 @@ public:
   void uploadPositions();
   /// \}
 
+  /// \brief Upload a contiguous subset of atom coordinates to the GPU.
+  ///
+  /// This method uploads only the coordinates for atoms in the range
+  /// [atom_start, atom_start + n_atoms) to the GPU. This is much more efficient
+  /// than uploading all coordinates when only a small subset has changed
+  /// (e.g., during GCMC insertion/deletion moves where typically 3-50 atoms change).
+  ///
+  /// IMPORTANT: This assumes the atoms being uploaded have CONTIGUOUS indices.
+  /// If atoms are not contiguous, use the full upload() method instead.
+  ///
+  /// Overloaded:
+  ///   - Upload atoms for a specific point in the time cycle
+  ///   - Upload atoms for the object's current position in the cycle
+  ///
+  /// \param atom_start  First atom index to upload (0-based)
+  /// \param n_atoms     Number of atoms to upload
+  /// \param orientation A selected point in the time cycle (WHITE or BLACK)
+  /// \{
+  void uploadAtoms(int atom_start, int n_atoms, CoordinateCycle orientation);
+  void uploadAtoms(int atom_start, int n_atoms);
+  /// \}
+
   /// \brief Upload current transformation matrices.
   void uploadTransformations();
 
