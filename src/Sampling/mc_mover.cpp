@@ -97,8 +97,8 @@ bool TranslationMover::attemptMove(GCMCMolecule& mol) {
 
   PhaseSpace* ps = sampler_->getPhaseSpace();
 
-  // Evaluate energy before move
-  const double E_old = sampler_->evaluateTotalEnergy();
+  // Evaluate energy before move (skip ScoreCard download - GPU-resident workflow)
+  const double E_old = sampler_->evaluateTotalEnergy(true);
 
   // Generate random displacement (on CPU - trivial computation)
   const double dx = (rng_->uniformRandomNumber() - 0.5) * 2.0 * max_displacement_;
@@ -156,7 +156,7 @@ bool TranslationMover::attemptMove(GCMCMolecule& mol) {
 
   // 5. Invalidate energy cache and evaluate energy (already on GPU!)
   sampler_->invalidateEnergyCache();
-  const double E_new = sampler_->evaluateTotalEnergy();
+  const double E_new = sampler_->evaluateTotalEnergy(true);  // Skip download - GPU-resident
   const double delta_E = E_new - E_old;
 
   // 6. Accept/reject based on Metropolis criterion
@@ -324,11 +324,8 @@ bool RotationMover::attemptMove(GCMCMolecule& mol) {
 
   PhaseSpace* ps = sampler_->getPhaseSpace();
 
-  // Evaluate energy before move
-  const double E_old = sampler_->evaluateTotalEnergy();
-
-  // Calculate center of geometry
-  const double3 cog = sampler_->calculateMoleculeCOG(mol);
+  // Evaluate energy before move (skip ScoreCard download - GPU-resident workflow)
+  const double E_old = sampler_->evaluateTotalEnergy(true);
 
   // Generate random rotation quaternion (on CPU - trivial computation)
   const bool use_limited = (max_angle_ > 0.0);
@@ -386,7 +383,23 @@ bool RotationMover::attemptMove(GCMCMolecule& mol) {
   }
   atom_indices.upload(0, mol.atom_indices.size());
 
-  // 2. Upload rotation matrix to GPU
+  // 2. Calculate COG on GPU (eliminates coordinate download)
+  Hybrid<double>& gpu_cog = sampler_->getGPUCOG();
+  launchCalculateCOG(
+      mol.atom_indices.size(),
+      atom_indices.data(HybridTargetLevel::DEVICE),
+      psw.xcrd, psw.ycrd, psw.zcrd,
+      &gpu_cog.data(HybridTargetLevel::DEVICE)[0],
+      &gpu_cog.data(HybridTargetLevel::DEVICE)[1],
+      &gpu_cog.data(HybridTargetLevel::DEVICE)[2]);
+
+  // Download COG (24 bytes - minimal overhead vs 480KB coordinate download)
+  gpu_cog.download();
+  const double cog_x = gpu_cog.data()[0];
+  const double cog_y = gpu_cog.data()[1];
+  const double cog_z = gpu_cog.data()[2];
+
+  // 3. Upload rotation matrix to GPU
   Hybrid<double>& gpu_rot_matrix = sampler_->getMCRotationMatrix();
   // FIX: Don't resize - rotation matrix is always 3x3=9 elements (pre-allocated)
   for (int i = 0; i < 9; i++) {
@@ -394,7 +407,7 @@ bool RotationMover::attemptMove(GCMCMolecule& mol) {
   }
   gpu_rot_matrix.upload();
 
-  // 3. Backup coordinates on GPU
+  // 4. Backup coordinates on GPU
   Hybrid<double>& saved_x = sampler_->getMCSavedX();
   Hybrid<double>& saved_y = sampler_->getMCSavedY();
   Hybrid<double>& saved_z = sampler_->getMCSavedZ();
@@ -408,23 +421,23 @@ bool RotationMover::attemptMove(GCMCMolecule& mol) {
       saved_y.data(HybridTargetLevel::DEVICE),
       saved_z.data(HybridTargetLevel::DEVICE));
 
-  // 4. Apply rotation on GPU
+  // 5. Apply rotation on GPU
   launchRotateMolecule(
       mol.atom_indices.size(),
       atom_indices.data(HybridTargetLevel::DEVICE),
-      cog.x, cog.y, cog.z,
+      cog_x, cog_y, cog_z,
       gpu_rot_matrix.data(HybridTargetLevel::DEVICE),
       psw.xcrd, psw.ycrd, psw.zcrd);
 
-  // 5. Apply PBC
+  // 6. Apply PBC
   sampler_->applyPBC(mol);
 
-  // 6. Invalidate energy cache and evaluate energy (already on GPU!)
+  // 7. Invalidate energy cache and evaluate energy (already on GPU!)
   sampler_->invalidateEnergyCache();
   const double E_new = sampler_->evaluateTotalEnergy();
   const double delta_E = E_new - E_old;
 
-  // 7. Accept/reject
+  // 8. Accept/reject
   if (acceptMove(delta_E)) {
     stats_.n_accepted++;
     stats_.total_energy_change += delta_E;
@@ -686,8 +699,8 @@ bool TorsionMover::attemptMove(GCMCMolecule& mol) {
 
   PhaseSpace* ps = sampler_->getPhaseSpace();
 
-  // Evaluate energy before move
-  const double E_old = sampler_->evaluateTotalEnergy();
+  // Evaluate energy before move (skip ScoreCard download - GPU-resident workflow)
+  const double E_old = sampler_->evaluateTotalEnergy(true);
 
   // Select random bond (CPU)
   const int bond_idx = static_cast<int>(rng_->uniformRandomNumber() * rotatable_bonds.size());

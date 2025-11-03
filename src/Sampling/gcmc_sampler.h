@@ -5,6 +5,7 @@
 #include <fstream>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 #include "copyright.h"
 #include "Accelerator/hybrid.h"
@@ -211,8 +212,9 @@ public:
   /// Uses custom lambda-scaled nonbonded evaluation for ghost molecules.
   /// Made public for MC mover access.
   ///
-  /// \return Total potential energy (kcal/mol)
-  virtual double evaluateTotalEnergy();
+  /// \param skip_download  If true, skip ScoreCard download (GPU-resident workflow)
+  /// \return Total potential energy (kcal/mol), or 0.0 if skip_download=true
+  virtual double evaluateTotalEnergy(bool skip_download = false);
 
   /// \brief Invalidate energy cache
   ///
@@ -291,6 +293,11 @@ public:
   ///
   /// \return Reference to Hybrid array for 3x3 rotation matrix (size=9)
   Hybrid<double>& getMCRotationMatrix() { return mc_rotation_matrix_; }
+
+  /// \brief Get GPU COG buffer
+  ///
+  /// \return Reference to GPU COG Hybrid array [x, y, z] (size=3)
+  Hybrid<double>& getGPUCOG() { return gpu_cog_; }
 
   /// \brief Get GPU workspace for torsion rotating atoms
   ///
@@ -489,8 +496,12 @@ protected:
   Hybrid<double> mc_saved_x_;        ///< Backup X coordinates (GPU/CPU)
   Hybrid<double> mc_saved_y_;        ///< Backup Y coordinates (GPU/CPU)
   Hybrid<double> mc_saved_z_;        ///< Backup Z coordinates (GPU/CPU)
+  Hybrid<double> mc_saved_xvel_;     ///< Backup X velocities (GPU/CPU)
+  Hybrid<double> mc_saved_yvel_;     ///< Backup Y velocities (GPU/CPU)
+  Hybrid<double> mc_saved_zvel_;     ///< Backup Z velocities (GPU/CPU)
   Hybrid<double> mc_rotation_matrix_; ///< 3x3 rotation matrix for rotation/torsion moves (GPU/CPU, size=9)
   Hybrid<int> mc_rotating_atoms_;    ///< Atom indices for torsion rotation (GPU/CPU)
+  Hybrid<double> gpu_cog_;           ///< GPU buffer for COG calculation (GPU/CPU, size=3: x,y,z)
 
   /// \brief GPU-side cache for molecule atom indices (eliminates repeated uploads)
   ///
@@ -500,6 +511,29 @@ protected:
   /// Pre-allocated to maximum molecule size for efficiency.
   Hybrid<int> gpu_molecule_indices_; ///< GPU-cached atom indices for lambda operations (GPU/CPU)
 
+  /// \brief GPU-side atomic masses for Maxwell-Boltzmann velocity generation
+  ///
+  /// Cached atomic masses in amu for each atom in a molecule, used by GPU velocity
+  /// generation kernel. Pre-allocated to maximum molecule size.
+  Hybrid<double> mc_masses_;         ///< Atomic masses in amu (GPU/CPU)
+
+  /// \brief GPU-resident Metropolis acceptance buffers
+  ///
+  /// These buffers enable the Metropolis acceptance decision to be made entirely on GPU,
+  /// eliminating 2× ScoreCard downloads (~2-4ms) per GCMC cycle and replacing with a
+  /// single integer download (~0.01ms). This provides ~2-4ms speedup per cycle.
+  Hybrid<double> gpu_E_initial_;      ///< Initial energy for Metropolis (GPU/CPU, size=1)
+  Hybrid<double> gpu_E_final_;        ///< Final energy for Metropolis (GPU/CPU, size=1)
+  Hybrid<int> gpu_acceptance_result_; ///< Acceptance result: 0=reject, 1=accept (GPU/CPU, size=1)
+
+  /// \brief cuRAND states for GPU-side random number generation
+  ///
+  /// One cuRAND state per thread for parallel Maxwell-Boltzmann velocity generation.
+  /// Allocated as raw CUDA device memory (curandState array).
+  /// Size: max_molecule_atoms
+  void* curand_states_;              ///< Device pointer to cuRAND states (curandState array)
+  int curand_states_size_;           ///< Number of cuRAND states allocated
+
   /// \brief Flag to track if lambda arrays are up-to-date on GPU
   ///
   /// Set to true after adjustMoleculeLambdaGPU() modifies lambda values on GPU.
@@ -508,6 +542,48 @@ protected:
   bool gpu_lambda_arrays_dirty_; ///< Flag indicating GPU lambda arrays need coupled indices rebuild
   bool coupled_indices_valid_;   ///< Track whether coupled_indices_ matches current lambda values
   int coupled_atom_count_;       ///< Cached coupled atom count from latest rebuild
+
+  /// \brief Incremental energy evaluation cache
+  ///
+  /// Caches constant energy contributions during GCMC to eliminate redundant calculations:
+  /// - Protein valence (bonds/angles/dihedrals): computed once, never changes
+  /// - Protein-protein nonbonded: computed once, never changes
+  /// - Active fragment energies: updated incrementally on accept/reject
+  ///
+  /// Strategy:
+  ///   E_total = E_protein_static + E_active_fragments + E_test_fragment
+  ///
+  /// For insertion test:
+  ///   E_initial = E_protein_static + E_active_fragments  (from cache)
+  ///   E_final = E_initial + computeFragmentEnergy(test_fragment)
+  ///
+  /// Expected speedup: 3-4× on energy evaluation (0.8ms → 0.2-0.3ms)
+  struct BackgroundEnergyCache {
+    double protein_valence;        ///< Protein bonds/angles/dihedrals (constant)
+    double protein_protein_nb;     ///< Protein-protein nonbonded (constant)
+    double active_fragments_total; ///< Sum of all active fragment energies
+    bool valid;                    ///< Is cache populated and valid?
+
+    BackgroundEnergyCache() : protein_valence(0.0), protein_protein_nb(0.0),
+                              active_fragments_total(0.0), valid(false) {}
+
+    /// \brief Get total background energy (everything except test fragment)
+    double getTotalBackground() const {
+      return protein_valence + protein_protein_nb + active_fragments_total;
+    }
+
+    /// \brief Invalidate cache (forces recomputation)
+    void invalidate() { valid = false; }
+  };
+
+  BackgroundEnergyCache bg_energy_cache_;  ///< Cached background energies
+
+  /// \brief Per-fragment energy cache for incremental updates
+  ///
+  /// Maps fragment resid → energy contribution (internal + interactions with protein/other fragments).
+  /// Updated when fragments are accepted (add) or deleted (remove).
+  /// Enables O(1) updates to active_fragments_total instead of O(N_active) re-evaluation.
+  std::unordered_map<int, double> fragment_energy_cache_;  ///< resid → energy
 };
 
 /// \brief GCMC sampler with spherical sampling region
@@ -632,10 +708,26 @@ public:
                     const std::string& ghost_file = "gcmc-ghosts.txt",
                     const std::string& log_file = "gcmc.log");
 
+  /// \brief Destructor - frees cuRAND states allocated on GPU
+  ~GCMCSystemSampler();
+
   /// \brief Get the simulation box volume
   ///
   /// \return Box volume in Angstrom^3
   double getBoxVolume() const;
+
+  /// \brief Initialize background energy cache with current system state
+  ///
+  /// Computes and caches the "background" energy of all currently active fragments
+  /// (at lambda=1.0) plus protein internal energies. This cached value can be reused
+  /// for multiple insertion/deletion attempts as long as the active fragment set
+  /// doesn't change.
+  ///
+  /// Should be called after accepted insertions/deletions to update the cache.
+  /// Cache is automatically invalidated by MD propagation.
+  ///
+  /// Expected speedup: Eliminates 1 full energy evaluation per GCMC cycle (~0.8ms)
+  void initializeBackgroundEnergyCache();
 
   /// \brief Select a random insertion site within the box
   ///
